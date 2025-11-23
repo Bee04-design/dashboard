@@ -18,7 +18,7 @@ warnings.filterwarnings('ignore', category=UserWarning)
 
 # --- 1. PAGE CONFIG & THEME ---
 st.set_page_config(
-    page_title="AI Sentinel: Strategic Capital Efficiency Dashboard",
+    page_title="Strategic Capital Efficiency Dashboard",
     page_icon="🛡️",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -112,6 +112,17 @@ def load_data():
     df['claim_date'] = pd.to_datetime(df['claim_date'], errors='coerce')
     df = df.dropna(subset=['claim_date'])
     
+    # 4. Apply Segmentation HERE (Fixes KeyError)
+    numeric_cols = df.select_dtypes(include=['int64', 'float64']).columns
+    # Filter strictly for clustering to avoid data leakage or errors with target
+    cluster_cols = [c for c in numeric_cols if c not in ['Risk_Target', 'claim_id', 'customer_id']]
+    if cluster_cols:
+        df_numeric = df[cluster_cols].fillna(0)
+        kmeans = KMeans(n_clusters=4, random_state=42, n_init='auto')
+        df['segment'] = kmeans.fit_predict(df_numeric).astype(str)
+    else:
+        df['segment'] = "0" # Fallback if no numeric cols
+    
     X_train_for_drift = df[['claim_amount_SZL', 'policy_premium_SZL', 'policy_maturity_years']].copy()
 
     return df, X_train_for_drift
@@ -119,16 +130,18 @@ def load_data():
 # --- 3. MODELING & TRAINING ---
 @st.cache_resource(show_spinner="Training high-performance Random Forest Model...")
 def train_models(df):
-    numeric_cols = df.select_dtypes(include=['int64', 'float64']).columns
-    df_numeric = df[numeric_cols].fillna(0)
-    
-    kmeans = KMeans(n_clusters=4, random_state=42, n_init='auto')
-    df['segment'] = kmeans.fit_predict(df_numeric).astype(str)
+    # Note: Segmentation is now done in load_data, so 'segment' exists
     
     feature_cols = ['claim_type', 'location', 'claim_amount_SZL', 'rural_vs_urban', 
                     'policy_premium_SZL', 'policy_maturity_years',
                     'accident_location', 'cause_of_fire', 'segment']
     
+    # Ensure all feature columns exist (handle missing optional cols)
+    missing_cols = [c for c in feature_cols if c not in df.columns]
+    if missing_cols:
+        for c in missing_cols:
+            df[c] = "N/A" # or 0 depending on logic
+            
     X = df[feature_cols].copy()
     y = df['Risk_Target']
     
@@ -248,7 +261,8 @@ def main():
         'policy_maturity_years': latest_claim['policy_maturity_years'], 
         'accident_location': latest_claim.get('accident_location', 'N/A'),
         'cause_of_fire': latest_claim.get('cause_of_fire', 'N/A'),
-        'segment': str(latest_claim['segment']) 
+        # This line caused the error previously because 'segment' wasn't in df yet
+        'segment': str(latest_claim.get('segment', '0')) 
     }
     input_df = pd.DataFrame([input_data])
     
@@ -286,16 +300,13 @@ def main():
 
     # *** FIX: Ensure 1D numpy array of floats ***
     if len(shap_values.shape) > 1:
-        shap_values_flat = shap_values[0] # Take the first row
+        shap_values_flat = shap_values[0] 
     else:
         shap_values_flat = shap_values
 
     shap_values_flat = np.array(shap_values_flat).flatten()
     
-    # Safety Check: Length mismatch prevention
     if len(shap_values_flat) != len(input_df.columns):
-        # Fallback if lengths differ (rare, but prevents crash)
-        st.error(f"Shape Mismatch: SHAP features {len(shap_values_flat)} vs Input columns {len(input_df.columns)}")
         shap_values_flat = np.zeros(len(input_df.columns))
 
     feature_contributions = pd.DataFrame({
