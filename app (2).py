@@ -212,8 +212,7 @@ def main():
     if df is None: return
     model, encoders, global_importance = train_models(df)
     
-    # --- HEADER ---
-    # Initialize session state for scenario if not present
+    # --- HEADER & NEWS TICKER ---
     if 'scenario_mode' not in st.session_state:
         st.session_state.scenario_mode = "None (Baseline)"
 
@@ -226,6 +225,7 @@ def main():
         news_text = "🚨 SECURITY ALERT: Civil Unrest reported. High risk of Arson & Theft claims."
 
     st.markdown(f"""<div class="ticker-wrap"><div class="ticker">{news_text} &nbsp;&nbsp;&nbsp;&nbsp; /// &nbsp;&nbsp;&nbsp;&nbsp; {news_text}</div></div>""", unsafe_allow_html=True)
+    
     st.title("🛡️ AI Sentinel: High-Risk Claim Classification Dashboard")
     st.markdown("Developed by Bhekiwe Sindiswa Dlamini | University of Eswatini")
 
@@ -263,7 +263,7 @@ def main():
 
     base_prob = model.predict_proba(enc_df)[0][1]
     
-    # --- XAI (SHAP) - FIX FOR INDEX ERROR & DIMENSION ERROR ---
+    # --- XAI (SHAP) - ROBUST FIX FOR DIMENSIONS ---
     explainer = shap.TreeExplainer(model)
     shap_values_result = explainer.shap_values(enc_df)
     
@@ -284,14 +284,19 @@ def main():
         else:
              expected_value = explainer.expected_value
 
-    # *** CRITICAL FIX: Ensure 1D array for DataFrame ***
+    # *** FIX: Ensure 1D numpy array of floats ***
     if len(shap_values.shape) > 1:
-        shap_values_flat = shap_values[0] # Extract the first row if it's (1, features)
+        shap_values_flat = shap_values[0] # Take the first row
     else:
-        shap_values_flat = shap_values # Already (features,)
+        shap_values_flat = shap_values
 
-    # Flatten specifically to 1D numpy array to be safe
     shap_values_flat = np.array(shap_values_flat).flatten()
+    
+    # Safety Check: Length mismatch prevention
+    if len(shap_values_flat) != len(input_df.columns):
+        # Fallback if lengths differ (rare, but prevents crash)
+        st.error(f"Shape Mismatch: SHAP features {len(shap_values_flat)} vs Input columns {len(input_df.columns)}")
+        shap_values_flat = np.zeros(len(input_df.columns))
 
     feature_contributions = pd.DataFrame({
         'Feature': input_df.columns, 
@@ -303,7 +308,7 @@ def main():
     # --- TABS ---
     tab1, tab2, tab5, tab6 = st.tabs([
         "🚦 Risk Engine (Prediction & XAI)", 
-        "🌐 Strategic Map (Spatial Risk)",
+        "🌐 Strategic Map (Spatial Risk)", 
         "🔮 Crystal Ball (Stress Test)",
         "📈 Future Horizons (Model Health & ROI)"
     ])
