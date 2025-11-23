@@ -212,24 +212,20 @@ def main():
     if df is None: return
     model, encoders, global_importance = train_models(df)
     
-    # --- HEADER & NEWS TICKER (Dynamic based on Tab 5 selection) ---
-    
+    # --- HEADER ---
     # Initialize session state for scenario if not present
     if 'scenario_mode' not in st.session_state:
         st.session_state.scenario_mode = "None (Baseline)"
 
     news_text = "📡 SYSTEM STATUS: Monitoring Active Claims. Presenting at Conference..."
-    
-    # Logic to change ticker based on "Crystal Ball"
     if st.session_state.scenario_mode == "Severe Weather (Flood/Storm)":
         news_text = "⛈️ WEATHER ALERT: Severe Storm Warning in Manzini & Mbabane. Flood risk ELEVATED. Verify all 'Storm Damage' claims."
     elif st.session_state.scenario_mode == "Pandemic (Viral Outbreak)":
         news_text = "⚠️ HEALTH ALERT: Viral outbreak detected. Expect surge in Health Claims."
     elif st.session_state.scenario_mode == "Civil Unrest":
         news_text = "🚨 SECURITY ALERT: Civil Unrest reported. High risk of Arson & Theft claims."
-        
+
     st.markdown(f"""<div class="ticker-wrap"><div class="ticker">{news_text} &nbsp;&nbsp;&nbsp;&nbsp; /// &nbsp;&nbsp;&nbsp;&nbsp; {news_text}</div></div>""", unsafe_allow_html=True)
-    
     st.title("🛡️ AI Sentinel: High-Risk Claim Classification Dashboard")
     st.markdown("Developed by Bhekiwe Sindiswa Dlamini | University of Eswatini")
 
@@ -267,7 +263,7 @@ def main():
 
     base_prob = model.predict_proba(enc_df)[0][1]
     
-    # --- XAI (SHAP) - ROBUST EXTRACTION ---
+    # --- XAI (SHAP) - FIX FOR INDEX ERROR & DIMENSION ERROR ---
     explainer = shap.TreeExplainer(model)
     shap_values_result = explainer.shap_values(enc_df)
     
@@ -288,10 +284,14 @@ def main():
         else:
              expected_value = explainer.expected_value
 
+    # *** CRITICAL FIX: Ensure 1D array for DataFrame ***
     if len(shap_values.shape) > 1:
-        shap_values_flat = shap_values[0]
+        shap_values_flat = shap_values[0] # Extract the first row if it's (1, features)
     else:
-        shap_values_flat = shap_values
+        shap_values_flat = shap_values # Already (features,)
+
+    # Flatten specifically to 1D numpy array to be safe
+    shap_values_flat = np.array(shap_values_flat).flatten()
 
     feature_contributions = pd.DataFrame({
         'Feature': input_df.columns, 
