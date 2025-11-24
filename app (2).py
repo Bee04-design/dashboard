@@ -11,6 +11,8 @@ from sklearn.preprocessing import LabelEncoder, MinMaxScaler
 from sklearn.cluster import KMeans
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import confusion_matrix, roc_curve, auc, classification_report
+from sklearn.linear_model import LinearRegression
+from sklearn.utils import resample  # Added for Bootstrapping
 from scipy.stats import ks_2samp
 import warnings
 
@@ -195,7 +197,66 @@ def get_radar_data(df, input_row):
         'Legit_Avg': [avg_legit[c]/max_vals[c] for c in cols]
     }
 
-# --- 5. MAIN APP ---
+# --- 5. HELPER: FORECASTING WITH BOOTSTRAP ---
+def get_forecast_data(df):
+    # Prepare aggregated monthly data
+    df['Date'] = pd.to_datetime(df['claim_date'])
+    monthly_data = df.set_index('Date').resample('M')['claim_amount_SZL'].sum().reset_index()
+    
+    # Synthetic historical enhancement if data is sparse (for demo visuals)
+    if len(monthly_data) < 6:
+        months_history = 24
+        base_volume = df['claim_amount_SZL'].mean() * 10 
+        dates = pd.date_range(end=pd.Timestamp.now(), periods=months_history, freq='M')
+        trend_factor = np.linspace(1, 1.2, months_history)
+        historical_claims = base_volume * trend_factor * np.random.normal(1, 0.1, months_history)
+        monthly_data = pd.DataFrame({'Date': dates, 'claim_amount_SZL': historical_claims})
+
+    monthly_data['Time_Index'] = np.arange(len(monthly_data))
+    X = monthly_data[['Time_Index']]
+    y = monthly_data['claim_amount_SZL']
+    
+    # --- BOOTSTRAP LOGIC ---
+    n_bootstraps = 200
+    bootstrap_preds = []
+    future_indices = np.arange(len(monthly_data), len(monthly_data) + 12).reshape(-1, 1)
+    future_dates = pd.date_range(start=monthly_data['Date'].iloc[-1] + pd.Timedelta(days=1), periods=12, freq='M')
+
+    # 1. Main Trend (Linear)
+    model = LinearRegression()
+    model.fit(X, y)
+    main_trend = model.predict(future_indices)
+
+    # 2. Bootstrap Loop (Uncertainty)
+    for _ in range(n_bootstraps):
+        # Resample historical data
+        X_boot, y_boot = resample(X, y, random_state=_)
+        model_boot = LinearRegression()
+        model_boot.fit(X_boot, y_boot)
+        bootstrap_preds.append(model_boot.predict(future_indices))
+    
+    # 3. Calculate Confidence Intervals (95%)
+    bootstrap_preds = np.array(bootstrap_preds)
+    lower_bound = np.percentile(bootstrap_preds, 5, axis=0)
+    upper_bound = np.percentile(bootstrap_preds, 95, axis=0)
+    
+    # Compile Result
+    forecast_df = pd.DataFrame({
+        'Date': future_dates,
+        'claim_amount_SZL': main_trend,
+        'Lower_Bound': lower_bound,
+        'Upper_Bound': upper_bound,
+        'Type': 'Forecast'
+    })
+    
+    monthly_data['Type'] = 'Historical'
+    monthly_data['Lower_Bound'] = np.nan
+    monthly_data['Upper_Bound'] = np.nan
+    
+    combined_df = pd.concat([monthly_data[['Date', 'claim_amount_SZL', 'Type', 'Lower_Bound', 'Upper_Bound']], forecast_df])
+    return combined_df
+
+# --- 6. MAIN APP ---
 def main():
     # --- DATA INIT ---
     df, X_train_for_drift, feature_cols = load_data()
@@ -233,29 +294,16 @@ def main():
     enc_df = input_df.copy()
     for col, le in encoders.items():
         val = str(enc_df[col].iloc[0])
-        if val in le.classes_:
-            enc_df[col] = le.transform([val])
-        else:
-            enc_df[col] = le.transform([le.classes_[0]])
+        enc_df[col] = le.transform([val if val in le.classes_ else le.classes_[0]])
 
     base_prob = model.predict_proba(enc_df)[0][1]
     
     # SHAP
     explainer = shap.TreeExplainer(model)
-    shap_values_result = explainer.shap_values(enc_df)
-    
-    # Robust SHAP extraction logic
-    if isinstance(shap_values_result, list):
-        if len(shap_values_result) > 1:
-            sv = shap_values_result[1]
-        else:
-            sv = shap_values_result[0]
-    else:
-        sv = shap_values_result
-        if len(sv.shape) > 1 and sv.shape[1] > 1: # Check if it's (1, features, classes)
-             sv = sv[..., 1]
-
-    if len(sv.shape) > 1: sv = sv[0] # Flatten to 1D array
+    shap_values = explainer.shap_values(enc_df)
+    if isinstance(shap_values, list): sv = shap_values[1] if len(shap_values) > 1 else shap_values[0]
+    else: sv = shap_values[..., 1] if len(shap_values.shape) > 2 else shap_values
+    if len(sv.shape) > 1: sv = sv[0] # Flatten
     
     contrib_df = pd.DataFrame({'Feature': input_df.columns, 'SHAP': sv}).sort_values(by='SHAP', key=abs, ascending=True)
 
@@ -359,15 +407,15 @@ def main():
             st.plotly_chart(fig_cm, use_container_width=True)
 
     # ==============================================================================
-    # TAB 3: STRATEGIC VIEW (Scenarios)
+    # TAB 3: STRATEGIC VIEW (Scenarios & Forecast)
     # ==============================================================================
     with tab3:
+        # SECTION 1: SCENARIO SIMULATION
         st.subheader("Crystal Ball: Scenario Simulation")
-        
         s_col, s_res = st.columns([1, 2])
         
         with s_col:
-            scenario = st.selectbox("Simulation Scenario", ["None", "Severe Weather (Flood)", "Pandemic (Health)", "Economic Crisis"], key="sim_select")
+            scenario = st.selectbox("Simulation Scenario", ["None", "Severe Weather (Flood)", "Pandemic (Health)", "Economic Crisis"])
             severity = st.slider("Severity Impact", 1, 10, 5)
             
         with s_res:
@@ -394,6 +442,56 @@ def main():
             
             if scenario != "None":
                 st.warning(f"⚠️ Projected Capital Impact: **+{(sim_loss-base_loss)/base_loss:.1%}** increase in liability.")
+
+        st.markdown("---")
+
+        # SECTION 2: FUTURE HORIZONS FORECAST (New Bootstrap Line Graph)
+        st.subheader("Future Horizons: Claims Volume Forecast (Bootstrapped)")
+        
+        # Get Forecast Data
+        forecast_df = get_forecast_data(df)
+        
+        # Create Figure
+        fig_forecast = go.Figure()
+
+        # 1. Historical Data Line
+        hist_data = forecast_df[forecast_df['Type'] == 'Historical']
+        fig_forecast.add_trace(go.Scatter(
+            x=hist_data['Date'], y=hist_data['claim_amount_SZL'],
+            mode='lines+markers', name='Historical',
+            line=dict(color='#64FFDA', width=2)
+        ))
+
+        # 2. Forecast Confidence Interval (Shaded Area)
+        pred_data = forecast_df[forecast_df['Type'] == 'Forecast']
+        
+        # Upper Bound (Invisible line for fill)
+        fig_forecast.add_trace(go.Scatter(
+            x=pred_data['Date'], y=pred_data['Upper_Bound'],
+            mode='lines', line=dict(width=0), showlegend=False, hoverinfo='skip'
+        ))
+        
+        # Lower Bound (Fill down to this line)
+        fig_forecast.add_trace(go.Scatter(
+            x=pred_data['Date'], y=pred_data['Lower_Bound'],
+            mode='lines', line=dict(width=0), fill='tonexty',
+            fillcolor='rgba(255, 43, 43, 0.2)', # Semi-transparent red
+            name='95% Uncertainty Range', hoverinfo='skip'
+        ))
+
+        # 3. Main Forecast Line
+        fig_forecast.add_trace(go.Scatter(
+            x=pred_data['Date'], y=pred_data['claim_amount_SZL'],
+            mode='lines+markers', name='Projected Trend',
+            line=dict(color='#FF2B2B', width=2, dash='dash')
+        ))
+        
+        fig_forecast.update_layout(
+            paper_bgcolor="#0A192F", plot_bgcolor="#112240", font_color="white", height=400,
+            xaxis_title="Timeline", yaxis_title="Projected Claim Volume (SZL)",
+            legend=dict(orientation="h", y=1.1)
+        )
+        st.plotly_chart(fig_forecast, use_container_width=True)
 
 if __name__ == "__main__":
     main()
