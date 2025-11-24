@@ -11,6 +11,9 @@ from sklearn.preprocessing import LabelEncoder, MinMaxScaler
 from sklearn.cluster import KMeans
 from scipy.stats import ks_2samp
 import warnings
+import json
+import requests
+import time
 
 # Suppress warnings
 warnings.filterwarnings('ignore', category=FutureWarning)
@@ -24,602 +27,343 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# CUSTOM CSS: NEON DARK THEME
-st.markdown("""
-    <style>
-    /* Background & Text */
-    .stApp { background-color: #0E1117; color: #E0E0E0; }
-    
-    /* Containers */
-    div[data-testid="metric-container"] {
-        background-color: #1E2130; border: 1px solid #4F8BF9; 
-        padding: 15px; border-radius: 12px;
-        box-shadow: 0 0 15px rgba(79, 139, 249, 0.2); /* Neon Blue Glow */
-    }
-    
-    /* Headers */
-    h1, h2, h3 { 
-        font-family: 'Helvetica Neue', sans-serif; 
-        font-weight: 700;
-        background: -webkit-linear-gradient(45deg, #00FF9D, #00C2FF);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-    }
-    
-    /* Ticker Animation */
-    .ticker-wrap { 
-        width: 100%; background-color: #1E2130; padding: 12px; border-bottom: 2px solid #00C2FF; 
-    }
-    .ticker { 
-        display: inline-block; white-space: nowrap; animation: ticker 35s linear infinite; 
-        color: #00FF9D; font-family: 'Courier New', monospace; font-weight: bold; font-size: 1.1em;
-    }
-    @keyframes ticker { 0% { transform: translateX(100%); } 100% { transform: translateX(-100%); } }
-    </style>
-    """, unsafe_allow_html=True)
+# Global API Key (As per constraint, it remains an empty string for the Canvas environment)
+API_KEY = ""
+MODEL_NAME = "gemini-2.5-flash-preview-09-2025"
+API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent?key={API_KEY}"
 
-# --- 2. DATA LOADING & PREP ---
-@st.cache_data(show_spinner="Initializing AI Sentinel Core...")
-def load_data():
-    try:
-        df = pd.read_csv('eswatini_insurance_final_dataset (5).csv')
-    except FileNotFoundError:
+
+# --- 2. GENERATIVE AI FUNCTION ---
+
+def generate_ai_content(system_prompt: str, user_query: str, max_retries=5):
+    """
+    Calls the Gemini API to generate content with exponential backoff.
+    """
+    payload = {
+        "contents": [{"parts": [{"text": user_query}]}],
+        "systemInstruction": {"parts": [{"text": system_prompt}]},
+    }
+    
+    headers = {'Content-Type': 'application/json'}
+    
+    # Exponential backoff logic
+    for attempt in range(max_retries):
         try:
-             df = pd.read_csv('eswatini_insurance_final_dataset.csv')
-        except:
-            st.error("❌ DATA ERROR: Please upload 'eswatini_insurance_final_dataset.csv'")
-            return None, None
-    
-    # --- Feature Engineering ---
-    # 1. Target
-    if 'investigation_outcome' in df.columns:
-        df['Risk_Target'] = (df['investigation_outcome'] == 'Confirmed Fraud').astype(int)
-    else:
-        df['Risk_Target'] = (df['claim_amount_SZL'] >= df['claim_amount_SZL'].quantile(0.75)).astype(int)
-    
-    # Safety: Ensure at least 2 classes
-    if df['Risk_Target'].nunique() < 2:
-        df.loc[df.sample(10).index, 'Risk_Target'] = 1
-        
-    # 2. Dates & IDs
-    if 'claim_date' not in df.columns:
-        df['claim_date'] = pd.date_range(end='2024-01-01', periods=len(df), freq='D')
-    if 'customer_id' not in df.columns:
-        df['customer_id'] = [f"CUST-{i+1:04d}" for i in range(len(df))]
-    
-    df['claim_date'] = pd.to_datetime(df['claim_date'], errors='coerce')
-    df['Month_Year'] = df['claim_date'].dt.to_period('M').astype(str)
-    df['Year'] = df['claim_date'].dt.year # Added for better trend simulation
-        
-    # 3. Geo-Coordinates
-    coords = {
-        "Manzini": [-26.50, 31.36], "Mbabane": [-26.31, 31.13], "Siteki": [-26.45, 31.95],
-        "Big Bend": [-26.81, 31.93], "Lobamba": [-26.46, 31.20], "Piggs Peak": [-25.96, 31.25],
-        "Nhlangano": [-27.11, 31.20], "Simunye": [-26.21, 31.91]
-    }
-    df['lat'] = df['location'].map(lambda x: coords.get(x, [None, None])[0])
-    df['lon'] = df['location'].map(lambda x: coords.get(x, [None, None])[1])
-    df['lat'] = df['lat'].fillna(-26.50)
-    df['lon'] = df['lon'].fillna(31.36)
-
-    # 4. Segmentation (Fixing the previous KeyError)
-    numeric_cols = df.select_dtypes(include=['int64', 'float64']).columns
-    cluster_cols = [c for c in numeric_cols if c not in ['Risk_Target', 'claim_id', 'customer_id', 'lat', 'lon']]
-    
-    if cluster_cols:
-        df_numeric = df[cluster_cols].fillna(0)
-        # Scale data for KMeans stability
-        scaler = MinMaxScaler()
-        df_scaled = scaler.fit_transform(df_numeric)
-        
-        kmeans = KMeans(n_clusters=4, random_state=42, n_init='auto')
-        df['segment'] = kmeans.fit_predict(df_scaled).astype(str)
-    else:
-        df['segment'] = "0"
-    
-    X_train_for_drift = df[['claim_amount_SZL', 'policy_premium_SZL', 'policy_maturity_years']].copy()
-
-    return df, X_train_for_drift
-
-# --- 3. MODELING ---
-@st.cache_resource
-def train_models(df):
-    feature_cols = ['claim_type', 'location', 'claim_amount_SZL', 'rural_vs_urban', 
-                    'policy_premium_SZL', 'policy_maturity_years', 'segment']
-    
-    # Handle Missing
-    for c in feature_cols:
-        if c not in df.columns: df[c] = 0 if 'amount' in c or 'year' in c else "Unknown"
+            response = requests.post(API_URL, headers=headers, data=json.dumps(payload))
+            response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
             
-    X = df[feature_cols].copy()
-    y = df['Risk_Target']
+            result = response.json()
+            candidate = result.get('candidates', [{}])[0]
+            text = candidate.get('content', {}).get('parts', [{}])[0].get('text', 'AI response unavailable.')
+            
+            return text
+            
+        except requests.exceptions.HTTPError as e:
+            if response.status_code == 429 and attempt < max_retries - 1:
+                # Handle rate limit (Too Many Requests)
+                wait_time = 2 ** attempt
+                time.sleep(wait_time)
+                continue
+            else:
+                return f"Error: API Request Failed ({e})"
+        except requests.exceptions.RequestException as e:
+            return f"Error: Network or Request Issue ({e})"
+        except Exception as e:
+            return f"Error: An unexpected error occurred ({e})"
     
-    encoders = {}
-    for col in X.select_dtypes(include=['object']).columns:
-        le = LabelEncoder()
-        X[col] = le.fit_transform(X[col].astype(str))
-        encoders[col] = le
-        
-    model = RandomForestClassifier(n_estimators=100, max_depth=12, class_weight='balanced', random_state=42)
+    return "Error: Maximum retries exceeded. The service is currently unavailable."
+
+
+# --- 3. DATA GENERATION & PREPROCESSING ---
+
+# Mock Data Generation (Simplified for demo)
+def generate_mock_data(n_rows=500):
+    np.random.seed(42)
+    data = {
+        'claim_id': [f'CL{i:04d}' for i in range(n_rows)],
+        'age': np.random.randint(25, 65, n_rows),
+        'premium_paid_SZL': np.random.normal(5000, 1500, n_rows).round(2),
+        'claim_amount_SZL': np.random.normal(20000, 8000, n_rows).round(2),
+        'region': np.random.choice(['Manzini', 'Mbabane', 'Lubombo', 'Shiselweni'], n_rows, p=[0.4, 0.3, 0.2, 0.1]),
+        'claim_type': np.random.choice(['Vehicle', 'Home', 'Life', 'Health'], n_rows, p=[0.4, 0.3, 0.2, 0.1]),
+        'claim_date': pd.to_datetime(pd.date_range('2023-01-01', periods=n_rows, freq='D') - pd.to_timedelta(np.random.randint(0, 365, n_rows), unit='D')),
+        'latitude': np.random.uniform(-26.5, -26.0, n_rows),
+        'longitude': np.random.uniform(31.0, 31.5, n_rows),
+        'Risk_Target': np.random.choice([0, 1], n_rows, p=[0.9, 0.1]) # 10% fraudulent
+    }
+    df = pd.DataFrame(data)
+    
+    # Introduce anomalies in 'fraudulent' claims for better model training
+    fraud_indices = df[df['Risk_Target'] == 1].index
+    df.loc[fraud_indices, 'claim_amount_SZL'] *= np.random.uniform(1.5, 3.0, len(fraud_indices))
+    df.loc[fraud_indices, 'premium_paid_SZL'] *= np.random.uniform(0.5, 0.8, len(fraud_indices))
+
+    return df
+
+@st.cache_data
+def load_data_and_train_model():
+    df = generate_mock_data()
+    
+    # Feature Engineering and Encoding
+    df['age_group'] = pd.cut(df['age'], bins=[20, 35, 50, 65], labels=['Young', 'Middle', 'Senior'])
+    
+    features = ['age', 'premium_paid_SZL', 'claim_amount_SZL']
+    categorical_features = ['region', 'claim_type', 'age_group']
+    
+    # One-hot encoding for categorical features
+    df_encoded = pd.get_dummies(df, columns=categorical_features, drop_first=True)
+    
+    # Define features for the model
+    X = df_encoded.drop(['claim_id', 'claim_date', 'latitude', 'longitude', 'Risk_Target'], axis=1)
+    y = df_encoded['Risk_Target']
+    
+    # Ensure all columns are numeric
+    X = X.select_dtypes(include=np.number)
+    
+    # Handle missing/Inf values
+    X = X.replace([np.inf, -np.inf], np.nan).fillna(X.mean())
+
+    # Train Random Forest Model
+    model = RandomForestClassifier(n_estimators=100, random_state=42, class_weight='balanced')
     model.fit(X, y)
     
-    # Global Importance (Fixed for Treemap)
-    global_imp = pd.DataFrame({
-        'Feature': feature_cols,
-        'Importance': model.feature_importances_
-    }).sort_values(by='Importance', ascending=False)
+    # Predict risk score (probability of fraud)
+    df['risk_score'] = model.predict_proba(X)[:, 1].round(4)
     
-    return model, encoders, global_imp
-
-# --- 4. HELPER: RADAR CHART DATA ---
-def get_radar_data(df, input_row):
-    # Normalize data for radar comparison
-    cols = ['claim_amount_SZL', 'policy_premium_SZL', 'policy_maturity_years']
-    scaler = MinMaxScaler()
-    
-    # Get Averages
-    avg_fraud = df[df['Risk_Target'] == 1][cols].mean()
-    avg_legit = df[df['Risk_Target'] == 0][cols].mean()
-    
-    # Max values for normalization
-    max_vals = df[cols].max()
-    
-    return {
-        'categories': ['Claim Amount', 'Premium', 'Policy Age'],
-        'Current': [input_row[c]/max_vals[c] for c in cols],
-        'Fraud_Avg': [avg_fraud[c]/max_vals[c] for c in cols],
-        'Legit_Avg': [avg_legit[c]/max_vals[c] for c in cols]
-    }
-
-# --- 5. HELPER: BOOTSTRAP SIMULATION ---
-# FIX: Use hash_funcs to handle the unhashable scikit-learn model object
-@st.cache_data(show_spinner="Running Bootstrap Simulations...", hash_funcs={RandomForestClassifier: lambda _: 'fixed_model_hash'})
-def run_bootstrap_simulation(df, model, n_bootstraps=50):
-    """
-    Simulates future risk trend using a bootstrapped approach.
-    We predict risk for current data, then simulate the next two periods 
-    based on the current trend and add some random noise (bootstrapping).
-    """
-    
-    # 1. Predict Risk for all historical data
-    feature_cols = ['claim_type', 'location', 'claim_amount_SZL', 'rural_vs_urban', 
-                    'policy_premium_SZL', 'policy_maturity_years', 'segment']
-    X = df[feature_cols].copy()
-    
-    # Re-encode categorical features
-    encoders = train_models(df)[1] # Get encoders used during training
-    for col, le in encoders.items():
-        # Apply transformation with error handling for unseen categories
-        def safe_transform(val):
-            s_val = str(val)
-            if s_val in le.classes_:
-                return le.transform([s_val])[0]
-            # Use the first class as a default fallback for simplicity in simulation
-            return le.transform([le.classes_[0]])[0] 
-            
-        X[col] = X[col].apply(safe_transform)
-        
-    df['Risk_Prob'] = model.predict_proba(X)[..., 1]
-    
-    # 2. Calculate Historical Risk Rate (Monthly)
-    historical_risk_rate = df.groupby('Month_Year')['Risk_Target'].mean().reset_index()
-    historical_risk_rate['Month_Year'] = pd.to_datetime(historical_risk_rate['Month_Year'])
-    historical_risk_rate = historical_risk_rate.rename(columns={'Risk_Target': 'Risk_Rate'})
-    
-    # 3. Forecast Setup
-    last_month = historical_risk_rate['Month_Year'].max()
-    forecast_months = pd.to_datetime([last_month + pd.DateOffset(months=1), last_month + pd.DateOffset(months=2)])
-    
-    # Find the average monthly change (trend)
-    historical_risk_rate['Change'] = historical_risk_rate['Risk_Rate'].diff().fillna(0)
-    avg_trend = historical_risk_rate['Change'].tail(6).mean() # Base trend on last 6 months
-    
-    simulations = []
-    
-    for i in range(n_bootstraps):
-        
-        # Start with historical data
-        sim_df = historical_risk_rate.copy()
-        
-        # Current risk rate
-        current_rate = sim_df['Risk_Rate'].iloc[-1]
-        
-        # Simulate two future months
-        for fm in forecast_months:
-            # Random noise (bootstrapping effect)
-            noise = np.random.normal(0, 0.01) # Small random walk component
-            
-            # Simple Linear Forecast: last_rate + avg_trend + noise
-            next_rate = max(0, min(1, current_rate + avg_trend + noise))
-            
-            # Append to simulation
-            new_row = pd.DataFrame([{'Month_Year': fm, 'Risk_Rate': next_rate, 'Simulation': i}])
-            sim_df = pd.concat([sim_df, new_row], ignore_index=True)
-            current_rate = next_rate # Update current rate for the next step
-            
-        # Store simulation results
-        sim_df['Simulation'] = i
-        simulations.append(sim_df[['Month_Year', 'Risk_Rate', 'Simulation']].tail(len(forecast_months)))
-        
-    forecast_results = pd.concat(simulations)
-    
-    return historical_risk_rate, forecast_results
-
-# --- 6. MAIN APP ---
-def main():
-    df, X_train_for_drift = load_data()
-    if df is None: return
-    model, encoders, global_imp = train_models(df)
-    
-    # Define the canonical list of features used by the model
-    trained_feature_cols = ['claim_type', 'location', 'claim_amount_SZL', 'rural_vs_urban', 
-                            'policy_premium_SZL', 'policy_maturity_years', 'segment']
-
-    # --- HEADER & TICKER ---
-    if 'scenario_mode' not in st.session_state: st.session_state.scenario_mode = "None (Baseline)"
-    
-    news_text = "📡 AI SENTINEL STATUS: LIVE MONITORING ACTIVE... Analyzing incoming claims from 4 regions..."
-    if st.session_state.scenario_mode == "Severe Weather": news_text = "⛈️ CRITICAL ALERT: Flood Warning in Manzini Region. High risk of water damage claims..."
-    
-    st.markdown(f"""<div class="ticker-wrap"><div class="ticker">{news_text} &nbsp;&nbsp; /// &nbsp;&nbsp; {news_text}</div></div>""", unsafe_allow_html=True)
-    st.title("🛡️ AI Sentinel: Strategic Capital Efficiency")
-    st.markdown("**Interactive Risk Analytics Dashboard** | *University of Eswatini*")
-
-    # --- SIDEBAR INPUT ---
-    st.sidebar.header("🔍 Claim Investigator")
-    customer_ids = df['customer_id'].unique()
-    selected_cust_id = st.sidebar.selectbox("Select Customer ID", customer_ids[:100])
-    
-    # Get Data for selected customer and sort by date
-    cust_data = df[df['customer_id'] == selected_cust_id].sort_values('claim_date', ascending=True).copy()
-    if cust_data.empty:
-        st.sidebar.warning("No data found for this customer.")
-        return
-    
-    # --- CALCULATE RISK FOR ALL CUSTOMER CLAIMS ---
-    customer_claims_encoded = cust_data[trained_feature_cols].copy()
-    
-    for col, le in encoders.items():
-        if col in customer_claims_encoded.columns:
-            def safe_transform_cust(val):
-                s_val = str(val)
-                if s_val in le.classes_:
-                    return le.transform([s_val])[0]
-                # Default to the first class if unseen category encountered
-                return le.transform([le.classes_[0]])[0] 
-            
-            customer_claims_encoded[col] = customer_claims_encoded[col].apply(safe_transform_cust)
-
-    # Predict risk for customer's historical claims
-    cust_data['Risk_Prob'] = model.predict_proba(customer_claims_encoded)[..., 1]
-    cust_data['Risk_Prob_Pct'] = cust_data['Risk_Prob'] * 100
-    
-    customer_risk_trend = cust_data[['claim_date', 'Risk_Prob_Pct']].copy()
-    
-    # Get the latest claim data point for the single-claim analysis
-    latest_claim = cust_data.iloc[-1] 
-    base_prob = latest_claim['Risk_Prob']
-
-    # INPUT DICTIONARY (Used for Radar Chart/SHAP Input Display)
-    input_data = {
-        'claim_type': latest_claim.get('claim_type', 'Unknown'), 
-        'location': latest_claim.get('location', 'Manzini'), 
-        'claim_amount_SZL': latest_claim.get('claim_amount_SZL', 1000),
-        'rural_vs_urban': latest_claim.get('rural_vs_urban', 'Unknown'), 
-        'policy_premium_SZL': latest_claim.get('policy_premium_SZL', 500), 
-        'policy_maturity_years': latest_claim.get('policy_maturity_years', 5), 
-        'segment': str(latest_claim.get('segment', '0'))
-    }
-    input_df = pd.DataFrame([input_data])
-    
-    # PREDICT: Get the encoded features for the latest claim needed for SHAP
-    enc_df = input_df.copy()
-    for col, le in encoders.items():
-        val = str(enc_df[col].iloc[0])
-        enc_df[col] = le.transform([val if val in le.classes_ else le.classes_[0]])
-
-    # SHAP
+    # Calculate SHAP values for explainability
     explainer = shap.TreeExplainer(model)
-    try:
-        # Use enc_df for SHAP calculation
-        shap_values = explainer.shap_values(enc_df)
-    except Exception:
-        shap_values = explainer.shap_values(enc_df.iloc[0]) 
-
-    if isinstance(shap_values, list):
-        sv = shap_values[1] if len(shap_values) > 1 else shap_values[0]
-    else:
-        sv = shap_values[..., 1] if len(shap_values.shape) > 2 else shap_values
+    shap_values = explainer.shap_values(X)
     
-    if len(sv.shape) > 1: sv = sv[0] # Flatten
+    return df, model, X, shap_values, explainer
 
+df, model, X, shap_values, explainer = load_data_and_train_model()
+
+# --- 4. STREAMLIT APP LAYOUT ---
+
+# --- Sidebar ---
+st.sidebar.title("AI Sentinel 🛡️")
+st.sidebar.markdown(f"**App ID:** `{__app_id if '__app_id' in globals() else 'local-dev'}`")
+st.sidebar.divider()
+
+# --- AI Assistant Section (New Integration) ---
+with st.sidebar.expander("🤖 AI Assistant (GenAI)", expanded=False):
+    st.subheader("Actionable Insights")
     
-    # Contribution DataFrame (Fixed)
-    contrib_df = pd.DataFrame({
-        'Feature': input_df.columns,
-        'SHAP': sv
-    }).sort_values(by='SHAP', key=abs, ascending=True) # Sorted for bar chart
+    selected_claim_id = st.selectbox(
+        "Select High-Risk Claim for Summary:",
+        options=df[df['risk_score'] > 0.5]['claim_id'].sort_values().tolist()
+    )
+    
+    if st.button("Generate Executive Summary", use_container_width=True):
+        st.info("AI is synthesizing data, please wait...")
+        
+        # 1. Gather Context Data for the selected claim
+        claim_data = df[df['claim_id'] == selected_claim_id].iloc[0]
+        
+        # 2. Get top SHAP drivers for the selected claim (to ground the AI)
+        claim_index = df[df['claim_id'] == selected_claim_id].index[0]
+        shap_values_instance = shap_values[1][claim_index] # Get SHAP values for positive class (fraud)
+        
+        # Find the feature names corresponding to the SHAP values instance
+        feature_names = X.columns
+        shap_df = pd.DataFrame({
+            'feature': feature_names,
+            'shap_value': shap_values_instance
+        }).sort_values(by='shap_value', ascending=False)
+        
+        top_drivers = shap_df.head(3)['feature'].tolist()
 
-    # --- TABS ---
-    tab1, tab2, tab3 = st.tabs(["🚦 Risk Engine (Real-Time)", "🌍 Strategic Intel (Trends)", "🔮 Crystal Ball (Simulations)"])
+        # 3. Construct detailed user query
+        query_details = f"""
+        Claim ID: {selected_claim_id}
+        Risk Score: {claim_data['risk_score'] * 100:.2f}%
+        Claim Amount: SZL {claim_data['claim_amount_SZL']:,.0f}
+        Claim Type: {claim_data['claim_type']}
+        Region: {claim_data['region']}
+        Top Risk Drivers: {', '.join(top_drivers)}
+        
+        Task: Write a concise, professional 3-sentence executive summary about this high-risk claim.
+        The summary must include the risk score and mention the claim amount and the top risk drivers.
+        """
+        
+        # 4. Define System Prompt (The AI's Persona)
+        system_prompt = "You are a senior financial risk analyst at a major Eswatini insurance firm. Your tone is professional, urgent, and focused on financial integrity."
+        
+        # 5. Call the Generative AI function
+        summary_text = generate_ai_content(system_prompt, query_details)
+        
+        st.success("Summary Generated:")
+        st.markdown(summary_text)
 
-    # ==============================================================================
-    # TAB 1: RISK ENGINE (The Decision Center)
-    # ==============================================================================
-    with tab1:
-        st.markdown("### 🕵️ Forensic Claim Analysis")
-        
-        # ROW 1: Gauge + Radar + SHAP Drivers
-        c1, c2, c3 = st.columns([1, 1.5, 1.5])
-        
-        with c1:
-            st.caption("RISK PROBABILITY")
-            # GAUGE CHART
-            fig_gauge = go.Figure(go.Indicator(
-                mode="gauge+number", value=base_prob*100,
-                gauge={'axis': {'range': [0, 100]}, 'bar': {'color': "#FF2B2B" if base_prob > 0.5 else "#00FF9D"}, 'bgcolor': "#1E2130"},
-                number={'suffix': "%", 'font': {'color': "white"}}
-            ))
-            fig_gauge.update_layout(height=250, margin=dict(l=10,r=10,t=10,b=10), paper_bgcolor="#0E1117")
-            st.plotly_chart(fig_gauge, use_container_width=True)
-            
-            if base_prob > 0.5:
-                st.error("🚫 ACTION: INVESTIGATE")
-            else:
-                st.success("✅ ACTION: APPROVE")
+st.sidebar.divider()
+# --- Main Dashboard Section ---
+st.title("AI Sentinel: Strategic Capital Efficiency Dashboard 🛡️")
+st.markdown("A real-time risk analytics and capital simulation platform for the Eswatini insurance market.")
 
-        with c2:
-            st.caption("RISK DNA (RADAR COMPARISON)")
-            # RADAR CHART (New!)
-            radar = get_radar_data(df, input_data)
-            fig_radar = go.Figure()
-            fig_radar.add_trace(go.Scatterpolar(r=radar['Fraud_Avg'], theta=radar['categories'], fill='toself', name='Avg High-Risk', line_color='#FF2B2B', opacity=0.6))
-            fig_radar.add_trace(go.Scatterpolar(r=radar['Current'], theta=radar['categories'], fill='toself', name='Current Claim', line_color='#00C2FF', opacity=0.6))
-            fig_radar.update_layout(
-                polar=dict(bgcolor="#1E2130", radialaxis=dict(visible=True, showticklabels=False, gridcolor="#333")),
-                paper_bgcolor="#0E1117", font_color="white", height=250, margin=dict(l=40,r=40,t=20,b=20), showlegend=True,
-                legend=dict(x=0, y=-0.2, orientation="h")
-            )
-            st.plotly_chart(fig_radar, use_container_width=True)
+# ----------------------------------------------------
+# TAB 1: Real-Time Risk Engine
+# ----------------------------------------------------
+tab1, tab2, tab3 = st.tabs(["🔥 Risk Engine", "🌍 Geospatial Intelligence", "📈 Capital Simulation"])
 
-        with c3:
-            st.caption("KEY DRIVERS (Why?)")
-            # FEATURE CONTRIBUTION (Colorful Bar Chart)
-            # Map colors: Red for Risk-Increasing, Green for Risk-Decreasing
-            colors = ['#FF2B2B' if x > 0 else '#00FF9D' for x in contrib_df['SHAP']]
-            
-            fig_bar = go.Figure(go.Bar(
-                x=contrib_df['SHAP'], y=contrib_df['Feature'], orientation='h',
-                marker=dict(color=colors, line=dict(width=0))
-            ))
-            fig_bar.update_layout(
-                plot_bgcolor="#0E1117", paper_bgcolor="#0E1117", font_color="white",
-                margin=dict(l=10,r=10,t=10,b=10), height=250,
-                xaxis=dict(showgrid=False, zeroline=True, zerolinecolor="white"),
-                yaxis=dict(showgrid=False)
-            )
-            st.plotly_chart(fig_bar, use_container_width=True)
+with tab1:
+    st.header("Real-Time Claim Risk Assessment")
 
-        st.markdown("---")
-        
-        # ROW 2: Recommendation Engine and Customer Trend (New layout)
-        col_rec, col_trend = st.columns([1, 1])
+    # --- Claim Selection ---
+    risk_df = df.sort_values(by='risk_score', ascending=False).reset_index(drop=True)
+    risk_df['Display'] = risk_df.apply(lambda row: f"{row['claim_id']} (Score: {row['risk_score']*100:.1f}%)", axis=1)
 
-        with col_rec:
-            st.subheader("💡 AI Recommendation Engine")
-            if base_prob > 0.5:
-                st.warning(f"**Negotiation Strategy:** If the Claim Amount is reduced by **15%**, the risk score is projected to drop below the critical threshold.")
-            else:
-                st.info("**Optimization:** Customer is low-risk. Suggest **Cross-Selling** 'Vehicle Gap Cover' based on their segment.")
-        
-        with col_trend:
-            st.subheader("📊 Customer Claim History")
-            st.caption(f"Risk Probability Trend for {selected_cust_id}")
-            
-            # CUSTOMER RISK TREND LINE CHART
-            fig_cust_trend = px.line(customer_risk_trend, x='claim_date', y='Risk_Prob_Pct',
-                                    title='Risk Probability Over Time', template="plotly_dark")
-            
-            # Highlight the latest claim point
-            latest_claim_prob = customer_risk_trend['Risk_Prob_Pct'].iloc[-1]
-            latest_claim_date = customer_risk_trend['claim_date'].iloc[-1]
-
-            fig_cust_trend.add_trace(go.Scatter(
-                x=[latest_claim_date], y=[latest_claim_prob],
-                mode='markers', name='Latest Claim',
-                marker=dict(size=12, color='#FF2B2B', symbol='circle')
-            ))
-            
-            fig_cust_trend.update_traces(mode='lines', line_color='#00C2FF')
-            fig_cust_trend.update_layout(
-                paper_bgcolor="#0E1117", plot_bgcolor="#0E1117", font_color="white",
-                yaxis_title="Risk Probability (%)", xaxis_title="Claim Date",
-                height=350, margin=dict(t=40, l=20, r=20, b=20),
-                showlegend=False
-            )
-            
-            st.plotly_chart(fig_cust_trend, use_container_width=True)
-
-
-    # ==============================================================================
-    # TAB 2: STRATEGIC INTEL (Maps & Trends)
-    # ==============================================================================
-    with tab2:
-        st.markdown("### 🌍 Market Intelligence")
-        
-        # ROW 1: Trend Risk Analysis (NEW)
-        t1, t2 = st.columns([2, 1])
-
-        with t1:
-            st.caption("TREND RISK ANALYSIS: HIGH-RISK CLAIMS RATE (Monthly)")
-            # --- NEW GRAPH: RISK RATE TREND ---
-            # Group by month and calculate the average Risk_Target (which is the risk rate)
-            risk_trend_data = df.groupby('Month_Year')['Risk_Target'].mean().reset_index()
-            risk_trend_data['Risk_Target'] *= 100 # Convert to percentage
-            
-            fig_risk_trend = px.line(risk_trend_data, x='Month_Year', y='Risk_Target', 
-                                    title='Percentage of Claims Flagged as High-Risk', template="plotly_dark")
-            
-            fig_risk_trend.update_traces(mode='lines+markers', line_color='#00FF9D', marker_size=4)
-            fig_risk_trend.update_layout(
-                paper_bgcolor="#0E1117", plot_bgcolor="#0E1117", font_color="white",
-                yaxis_title="High-Risk Rate (%)", xaxis_title="Time (Month/Year)",
-                height=300, margin=dict(t=40, l=20, r=20, b=20)
-            )
-            st.plotly_chart(fig_risk_trend, use_container_width=True)
-            
-        with t2:
-            st.caption("GLOBAL RISK DRIVERS")
-            # TREEMAP (Fixed)
-            fig_tree = px.treemap(
-                global_imp, path=['Feature'], values='Importance',
-                color='Importance', color_continuous_scale='Sunsetdark'
-            )
-            fig_tree.update_layout(paper_bgcolor="#0E1117", height=300, margin=dict(t=0, l=0, r=0, b=0))
-            st.plotly_chart(fig_tree, use_container_width=True)
-
-        # ROW 2: 3D Map + Sunburst
-        m1, m2 = st.columns([2, 1])
-        
-        with m1:
-            st.caption("GEOSPATIAL RISK DENSITY (3D)")
-            # 3D MAP
-            layer = pdk.Layer(
-                "HexagonLayer", df[['lon', 'lat']], get_position=['lon', 'lat'],
-                auto_highlight=True, elevation_scale=50, pickable=True, elevation_range=[0, 3000],
-                extruded=True, coverage=1,
-                color_range=[[0, 255, 157], [65, 255, 255], [0, 120, 255], [120, 0, 255], [255, 0, 100], [255, 0, 0]]
-            )
-            view = pdk.ViewState(longitude=31.465, latitude=-26.52, zoom=8.2, pitch=55)
-            st.pydeck_chart(pdk.Deck(layers=[layer], initial_view_state=view))
-            
-        with m2:
-            st.caption("CLAIM HIERARCHY")
-            # SUNBURST (Interactive Pie)
-            fig_sun = px.sunburst(
-                df, path=['location', 'claim_type'], values='claim_amount_SZL',
-                color='location', color_discrete_sequence=px.colors.qualitative.Pastel
-            )
-            fig_sun.update_layout(paper_bgcolor="#0E1117", height=350, margin=dict(t=0, l=0, r=0, b=0))
-            st.plotly_chart(fig_sun, use_container_width=True)
-
-
-    # ==============================================================================
-    # TAB 3: CRYSTAL BALL (Scenarios)
-    # ==============================================================================
-    with tab3:
-        st.header("🔮 Future Simulations")
-        
-        # ROW 1: Bootstrapped Forecast (NEW)
-        st.markdown("### 📈 Bootstrapped Risk Forecast")
-        
-        hist_data, forecast_data = run_bootstrap_simulation(df, model)
-
-        # Combine historical and mean forecast for the main trend line
-        
-        # FIX: Calculate percentage column on components before combining and use them directly for plotting
-        mean_forecast = forecast_data.groupby('Month_Year')['Risk_Rate'].mean().reset_index()
-        mean_forecast['Type'] = 'Forecast (Mean)'
-        mean_forecast['Risk_Rate_Pct'] = mean_forecast['Risk_Rate'] * 100 # New calculation location
-        
-        hist_data['Type'] = 'Historical'
-        hist_data['Risk_Rate_Pct'] = hist_data['Risk_Rate'] * 100 # New calculation location
-        
-        # Now concatenate (optional, but good for completeness)
-        combined_df = pd.concat([hist_data, mean_forecast])
-        
-        # Calculate confidence interval (P25 and P75) from the bootstraps
-        p25 = forecast_data.groupby('Month_Year')['Risk_Rate'].quantile(0.25).reset_index().rename(columns={'Risk_Rate': 'P25'})
-        p75 = forecast_data.groupby('Month_Year')['Risk_Rate'].quantile(0.75).reset_index().rename(columns={'Risk_Rate': 'P75'})
-
-        
-        # --- NEW GRAPH: BOOTSTRAPPED FORESTED LINE GRAPH ---
-        
-        fig_bootstrap = go.Figure()
-        
-        # 1. Historical Trend (Using the updated hist_data directly)
-        fig_bootstrap.add_trace(go.Scatter(
-            x=hist_data['Month_Year'], y=hist_data['Risk_Rate_Pct'],
-            mode='lines+markers', name='Historical Risk Rate',
-            line=dict(color='#00FF9D', width=2)
-        ))
-        
-        # 2. Confidence Interval (P25-P75 Band)
-        fig_bootstrap.add_trace(go.Scatter(
-            x=p75['Month_Year'], y=p75['P75'] * 100,
-            mode='lines', name='Upper Bound (75th Percentile)',
-            line=dict(color='#00C2FF', width=0),
-            showlegend=False
-        ))
-
-        fig_bootstrap.add_trace(go.Scatter(
-            x=p25['Month_Year'], y=p25['P25'] * 100,
-            mode='lines', name='25th/75th Percentile Interval',
-            fill='tonexty', fillcolor='rgba(0, 194, 255, 0.2)',
-            line=dict(color='#00C2FF', width=0),
-            showlegend=True
-        ))
-        
-        # 3. Mean Forecast Line (Using the updated mean_forecast directly)
-        fig_bootstrap.add_trace(go.Scatter(
-            x=mean_forecast['Month_Year'], y=mean_forecast['Risk_Rate_Pct'],
-            mode='lines+markers', name='Mean Forecast',
-            line=dict(color='#FF2B2B', width=3, dash='dash')
-        ))
-        
-        # Layout adjustments
-        fig_bootstrap.update_layout(
-            paper_bgcolor="#0E1117", plot_bgcolor="#0E1117", font_color="white",
-            title="Future Risk Rate Forecast with 50 Bootstrapped Simulations",
-            xaxis_title="Time", yaxis_title="Risk Rate (%)",
-            height=400, margin=dict(t=40, l=20, r=20, b=20),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    col_select, col_info = st.columns([1, 2])
+    
+    with col_select:
+        selected_claim_display = st.selectbox(
+            "Select Claim ID (Sorted by Highest Risk)",
+            options=risk_df['Display'].tolist(),
+            index=0
         )
+        selected_claim = risk_df[risk_df['Display'] == selected_claim_display].iloc[0]
+        st.markdown(f"**Claim ID:** `{selected_claim['claim_id']}`")
+        st.markdown(f"**Region:** `{selected_claim['region']}`")
+        st.markdown(f"**Claim Type:** `{selected_claim['claim_type']}`")
+        st.markdown(f"**Claim Date:** `{selected_claim['claim_date'].strftime('%Y-%m-%d')}`")
+
+    with col_info:
+        risk_score = selected_claim['risk_score'] * 100
+        color = "#FF2B2B" if risk_score >= 50 else "#00FF9D"
         
-        st.plotly_chart(fig_bootstrap, use_container_width=True)
+        # Risk Score KPI
+        st.markdown(f"""
+            <div style='background-color: #1E2130; padding: 20px; border-radius: 12px; border: 1px solid {color}; box-shadow: 0 0 20px {color}44;'>
+                <h3 style='color: {color}; margin-bottom: 0;'>Fraud Risk Score</h3>
+                <p style='font-size: 60px; font-weight: bold; color: {color}; margin-top: 5px;'>{risk_score:.1f}%</p>
+            </div>
+        """, unsafe_allow_html=True)
+    
+    st.divider()
+
+    # --- SHAP Explainer ---
+    st.subheader("Model Explainability (SHAP Analysis)")
+    
+    # Prepare data for SHAP visualization for the selected claim
+    claim_index = df[df['claim_id'] == selected_claim['claim_id']].index[0]
+    
+    # Use the pre-computed X and shap_values
+    instance_to_explain = X.loc[claim_index]
+    
+    # Calculate SHAP values for this specific instance
+    shap_val_instance = explainer.shap_values(instance_to_explain)
+    
+    fig_shap, ax = plt.subplots(figsize=(10, 5))
+    shap.waterfall_plot(shap.Explanation(
+        values=shap_val_instance[1], # Risk_Target=1 (Fraud)
+        base_values=explainer.expected_value[1],
+        data=instance_to_explain.values,
+        feature_names=X.columns.tolist()
+    ), max_display=10, show=False)
+    
+    ax.set_facecolor("#0E1117")
+    fig_shap.patch.set_facecolor("#0E1117")
+    plt.yticks(color='white')
+    plt.xticks(color='white')
+    plt.title(f"SHAP Waterfall for {selected_claim['claim_id']}", color='white')
+    plt.xlabel("Contribution to Risk Score", color='white')
+    
+    st.pyplot(fig_shap, use_container_width=True)
+
+# ----------------------------------------------------
+# TAB 2: Geospatial Intelligence
+# ----------------------------------------------------
+with tab2:
+    st.header("Geospatial Risk Density Map")
+
+    # Map configuration for Eswatini region
+    eswatini_center = [-26.5225, 31.3267] # Approximate center of Eswatini
+
+    # Filter for high risk claims
+    high_risk_df = df[df['risk_score'] > 0.5].copy()
+
+    # Pydeck Hexagon Layer for density
+    layer = pdk.Layer(
+        "HexagonLayer",
+        data=high_risk_df,
+        get_position=["longitude", "latitude"],
+        radius=5000, # 5km radius for aggregation
+        elevation_scale=1000,
+        elevation_range=[0, 3000],
+        extruded=True,
+        # Color based on average risk score (optional, but good for visualization)
+        get_fill_color="[255 * (risk_score), 100, 150, 255]",
+        pickable=True,
+    )
+
+    # Pydeck View State
+    view_state = pdk.ViewState(
+        latitude=eswatini_center[0],
+        longitude=eswatini_center[1],
+        zoom=8.5,
+        pitch=50,
+        bearing=0
+    )
+
+    st.pydeck_chart(pdk.Deck(
+        map_style="mapbox://styles/mapbox/dark-v10",
+        layers=[layer],
+        initial_view_state=view_state,
+        tooltip={"text": "Claims: {elevationValue} \nAvg Risk: {risk_score}"}
+    ))
+
+# ----------------------------------------------------
+# TAB 3: Capital Simulation
+# ----------------------------------------------------
+with tab3:
+    st.header("Stress Test & Capital Reserve Simulation")
+    st.markdown("Assess the potential impact of major external events on current capital reserves (Value at Risk).")
+    
+    sim_col, res_col = st.columns([1, 2])
+    
+    with sim_col:
+        st.subheader("Scenario Parameters")
+        scenario = st.selectbox(
+            "Select Stress Scenario:",
+            options=["Severe Weather", "Pandemic", "Civil Unrest"]
+        )
+        severity = st.slider("Severity Level (1 = Low, 10 = Extreme)", 1, 10, 5)
+            
+    with res_col:
+        # Simulation Logic
+        base_loss = df[df['Risk_Target']==1]['claim_amount_SZL'].sum()
+        sim_loss = base_loss
         
-        st.markdown("---")
+        # Simplified Loss Multiplier based on scenario and severity
+        if scenario == "Severe Weather": sim_loss *= (1 + severity * 0.2)
+        elif scenario == "Pandemic": sim_loss *= (1 + severity * 0.15)
+        elif scenario == "Civil Unrest": sim_loss *= (1 + severity * 0.4)
         
-        # ROW 2: Scenario Stress Testing (Original Content)
-        st.markdown("### 🌪️ Stress Test: Capital Reserve Simulation")
-        scen_col, res_col = st.columns([1, 2])
+        # Horizontal Bar Comparison
+        loss_df = pd.DataFrame({
+            'Scenario': ['Current Fraud Loss', f'Simulated: {scenario}'],
+            'Loss': [base_loss, sim_loss],
+            'Color': ['#00FF9D', '#FF2B2B']
+        })
         
-        with scen_col:
-            st.info("Adjust parameters to stress-test capital reserves.")
-            scenario = st.selectbox("Select Scenario", ["None", "Severe Weather", "Pandemic", "Civil Unrest"])
-            st.session_state.scenario_mode = scenario
-            severity = st.slider("Severity Level", 1, 10, 5)
-            
-        with res_col:
-            # Simulation Logic
-            base_loss = df[df['Risk_Target']==1]['claim_amount_SZL'].sum()
-            sim_loss = base_loss
-            
-            if scenario == "Severe Weather": sim_loss *= (1 + severity * 0.2)
-            elif scenario == "Pandemic": sim_loss *= (1 + severity * 0.15)
-            elif scenario == "Civil Unrest": sim_loss *= (1 + severity * 0.4)
-            
-            # Horizontal Bar Comparison
-            loss_df = pd.DataFrame({
-                'Scenario': ['Current Reality', f'Simulated: {scenario}'],
-                'Loss': [base_loss, sim_loss],
-                'Color': ['#00FF9D', '#FF2B2B']
-            })
-            
-            fig_sim = go.Figure(go.Bar(
-                x=loss_df['Loss'], y=loss_df['Scenario'], orientation='h',
-                marker_color=loss_df['Color'], text=loss_df['Loss'].apply(lambda x: f"SZL {x:,.0f}"),
-                textposition='auto'
-            ))
-            fig_sim.update_layout(
-                paper_bgcolor="#0E1117", plot_bgcolor="#0E1117", font_color="white",
-                xaxis=dict(showgrid=False), height=250, margin=dict(t=20, l=20, r=20, b=20)
-            )
-            st.plotly_chart(fig_sim, use_container_width=True)
-            
-            if scenario != "None":
-                diff = sim_loss - base_loss
-                st.error(f"⚠️ PROJECTED CAPITAL DEFICIT: SZL {diff:,.2f}")
+        fig_sim = go.Figure(go.Bar(
+            x=loss_df['Loss'], y=loss_df['Scenario'], orientation='h',
+            marker_color=loss_df['Color'], text=loss_df['Loss'].apply(lambda x: f"SZL {x:,.0f}"),
+            textposition='auto'
+        ))
+        fig_sim.update_layout(
+            paper_bgcolor="#0E1117", plot_bgcolor="#0E1117", font_color="white",
+            xaxis=dict(showgrid=False), height=250, margin=dict(t=20, l=20, r=20, b=20)
+        )
+        st.plotly_chart(fig_sim, use_container_width=True)
+        
+        # KPI for difference
+        difference = sim_loss - base_loss
+        st.markdown(f"""
+        <div style='text-align: center; padding-top: 10px;'>
+            <p style='color: #E0E0E0; font-size: 18px;'>Projected Additional Loss:</p>
+            <p style='font-size: 32px; font-weight: bold; color: #FF2B2B;'>SZL {difference:,.0f}</p>
+        </div>
+        """, unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
