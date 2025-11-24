@@ -1,5 +1,5 @@
 from sklearn.preprocessing import LabelEncoder
-from sklearn.pipeline import Pipeline
+from sklearn.pipeline import Pipeline as SklearnPipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler, OrdinalEncoder
 from sklearn.compose import ColumnTransformer
 from sklearn.model_selection import train_test_split
@@ -32,11 +32,12 @@ from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 import random
 import io
+from sklearn.utils.class_weight import compute_class_weight
 
 # Setup Logging with Version Control
 logging.basicConfig(filename='app.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-MODEL_VERSION = "v1.0"
+MODEL_VERSION = "v1.1 (ADASYN Safety Implemented)"
 DATASET_VERSION = "2025-05-20"
 MODEL_LAST_TRAINED = "2025-05-20 12:10:00"
 
@@ -49,7 +50,7 @@ st.set_page_config(page_title="Insurance Risk Dashboard", page_icon="📊", layo
 
 # Title and Version Info
 st.title("Insurance Risk Streamlit Dashboard")
-st.markdown(f"_Prototype v0.4.7 | Model: **RandomForest {MODEL_VERSION}** | Last Trained: {MODEL_LAST_TRAINED}_")
+st.markdown(f"_Prototype v0.4.8 | Model: **RandomForest {MODEL_VERSION}** | Last Trained: {MODEL_LAST_TRAINED}_")
 
 # --- Helper Functions ---
 
@@ -57,6 +58,7 @@ st.markdown(f"_Prototype v0.4.7 | Model: **RandomForest {MODEL_VERSION}** | Last
 def load_data():
     """Loads and performs initial cleaning/feature engineering on the dataset."""
     try:
+        # NOTE: This line assumes you have uploaded 'eswatini_insurance_final_dataset (5).csv'
         df = pd.read_csv("eswatini_insurance_final_dataset (5).csv")
         logger.info("Dataset loaded successfully.")
 
@@ -67,8 +69,11 @@ def load_data():
         # Based on the abstract, "High-Risk Claim Classification" is the goal.
         df['risk_flag'] = (df['coverage_type'].str.lower().str.contains('premium|high-risk|high') | (df['claim_amount_szl'] > df['claim_amount_szl'].median() * 1.5)).astype(int)
 
-        # Handle NaNs
+        # Handle NaNs and missing values
         df.replace([np.inf, -np.inf], np.nan, inplace=True)
+        # Drop rows with NaN in the target variable if any were introduced
+        df.dropna(subset=['risk_flag'], inplace=True) 
+
         # For simplicity, filling numeric NaNs with mean and categorical with 'Missing'
         for col in df.select_dtypes(include=np.number).columns:
             df[col] = df[col].fillna(df[col].mean())
@@ -85,12 +90,17 @@ def load_data():
 @st.cache_resource(show_spinner="Training/Loading Model and Calculating SHAP values...")
 def get_model_and_shap_data(df):
     """
-    Trains a Random Forest model using ADASYN for imbalance correction and
-    calculates SHAP values for interpretability.
+    Trains a Random Forest model, optionally using ADASYN for imbalance correction, 
+    and calculates SHAP values for interpretability.
     """
     # 1. Feature Engineering and Setup
     df = df.copy()
-    X = df.drop(columns=['risk_flag', 'claim_id', 'customer_id', 'claim_date', 'coverage_type'])
+    
+    # Check if the target column exists and has variability
+    if 'risk_flag' not in df.columns or df['risk_flag'].nunique() < 2:
+        raise ValueError("Target variable 'risk_flag' is missing or only contains one class.")
+
+    X = df.drop(columns=['risk_flag', 'claim_id', 'customer_id', 'claim_date', 'coverage_type'], errors='ignore')
     y = df['risk_flag']
 
     # Define feature types
@@ -106,16 +116,34 @@ def get_model_and_shap_data(df):
         remainder='passthrough'
     )
 
-    # 2. Pipeline Definition (ADASYN + RandomForest)
-    # The abstract mentions ADASYN and Random Forest
-    model = RandomForestClassifier(n_estimators=100, random_state=42, class_weight='balanced')
+    # 2. Imbalance Check and Pipeline Definition (ADASYN + RandomForest)
+    class_counts = y.value_counts()
+    minority_class = class_counts.min()
     
-    # Combined pipeline: Preprocessing -> Imbalance Correction -> Model
-    pipeline = ImbPipeline(steps=[
-        ('preprocessor', preprocessor),
-        ('oversample', ADASYN(random_state=42, n_neighbors=5)),
-        ('classifier', model)
-    ])
+    # ADASYN requires enough samples in the minority class (typically >= n_neighbors + 1)
+    # Using a safe threshold (e.g., 20) for ADASYN stability
+    ADASYN_THRESHOLD = 20 
+
+    # Determine if ADASYN should be used
+    use_adasyn = minority_class >= ADASYN_THRESHOLD
+    
+    if use_adasyn:
+        logger.info(f"Using ADASYN: Minority class size ({minority_class}) >= {ADASYN_THRESHOLD}")
+        pipeline_steps = [
+            ('preprocessor', preprocessor),
+            # ADASYN parameters can be tuned, n_neighbors must be < minority class size
+            ('oversample', ADASYN(random_state=42, n_neighbors=min(5, minority_class - 1))), 
+            ('classifier', RandomForestClassifier(n_estimators=100, random_state=42, class_weight=None))
+        ]
+        pipeline = ImbPipeline(steps=pipeline_steps)
+    else:
+        logger.warning(f"ADASYN skipped: Minority class size ({minority_class}) < {ADASYN_THRESHOLD}. Using class_weight='balanced'.")
+        # If ADASYN is skipped, we use the standard sklearn pipeline and rely on class weights
+        model = RandomForestClassifier(n_estimators=100, random_state=42, class_weight='balanced')
+        pipeline = SklearnPipeline(steps=[
+            ('preprocessor', preprocessor),
+            ('classifier', model)
+        ])
 
     # 3. Model Training
     pipeline.fit(X, y)
@@ -140,47 +168,72 @@ def get_model_and_shap_data(df):
     recall_class_1 = TP / (TP + FN) if (TP + FN) > 0 else 0.0
 
     # 6. SHAP Value Calculation
-    # Get the feature names after one-hot encoding
-    feature_names = numerical_features + list(pipeline['preprocessor'].named_transformers_['cat'].get_feature_names_out(categorical_features))
     
-    # Get the transformed data for SHAP (after preprocessor and ADASYN)
+    # Extract feature names after preprocessing
+    if use_adasyn:
+        # If ImbPipeline is used, preprocessor is the first step
+        ohe = pipeline['preprocessor'].named_transformers_['cat']
+        classifier = pipeline['classifier']
+    else:
+        # If SklearnPipeline is used, preprocessor is the first step
+        ohe = pipeline['preprocessor'].named_transformers_['cat']
+        classifier = pipeline['classifier']
+        
+    feature_names = numerical_features + list(ohe.get_feature_names_out(categorical_features))
+    
+    # Transform data for SHAP (only preprocessing step needed)
     X_transformed = pipeline['preprocessor'].transform(X)
 
     # SHAP Explainer (using the trained Random Forest model)
-    explainer = shap.TreeExplainer(pipeline['classifier'])
-    # Due to ADASYN, the SHAP calculation must use the transformed data (X_transformed)
-    # We will use a small sample for SHAP for performance in Streamlit
-    X_shap = X_transformed[random.sample(range(X_transformed.shape[0]), min(1000, X_transformed.shape[0]))]
+    explainer = shap.TreeExplainer(classifier)
+    
+    # Use a small sample for SHAP for performance in Streamlit
+    sample_indices = random.sample(range(X_transformed.shape[0]), min(1000, X_transformed.shape[0]))
+    X_shap = X_transformed[sample_indices]
+    
     shap_values = explainer.shap_values(X_shap)
     
     # SHAP Summary DF
     if isinstance(shap_values, list): # For multi-class, get SHAP for target class (1)
-        shap_values_target = shap_values[1]
+        # Ensure the classifier is trained and shap_values[1] exists
+        if len(shap_values) > 1:
+            shap_values_target = shap_values[1]
+        else:
+            shap_values_target = shap_values[0] # Fallback if only one class predicted
     else:
         shap_values_target = shap_values
 
     # Calculate mean absolute SHAP value for each feature
     mean_abs_shap = np.abs(shap_values_target).mean(axis=0)
-    shap_df = pd.DataFrame({
-        'Feature': feature_names,
-        'SHAP Value': mean_abs_shap
-    }).sort_values(by='SHAP Value', ascending=False)
     
+    # Handle potential mismatch in feature_names length (e.g., if one-hot encoding failed)
+    if len(feature_names) == len(mean_abs_shap):
+        shap_df = pd.DataFrame({
+            'Feature': feature_names,
+            'SHAP Value': mean_abs_shap
+        }).sort_values(by='SHAP Value', ascending=False)
+    else:
+        logger.error("SHAP feature count mismatch. SHAP DataFrame initialization skipped.")
+        shap_df = pd.DataFrame() # Return empty DataFrame on failure
+
     # Save the feature names (needed for displaying SHAP)
     st.session_state['feature_names'] = feature_names
     
     # Save SHAP plot for download
     try:
-        plt.figure(figsize=(10, 6))
-        shap.summary_plot(shap_values_target, X_shap, feature_names=feature_names, show=False)
-        plt.tight_layout()
-        plt.savefig(os.path.join(save_dir, 'shap_plot.png'))
-        plt.close()
+        if not shap_df.empty:
+            plt.figure(figsize=(10, 6))
+            shap.summary_plot(shap_values_target, X_shap, feature_names=feature_names, show=False)
+            plt.tight_layout()
+            plt.savefig(os.path.join(save_dir, 'shap_plot.png'))
+            plt.close()
+        else:
+             logger.warning("Skipping SHAP plot generation due to empty SHAP dataframe.")
     except Exception as e:
         logger.warning(f"SHAP plot generation failed: {str(e)}")
 
 
-    logger.info(f"Model trained. AUC: {roc_auc:.2f}, Recall (High Risk): {recall_class_1:.2f}")
+    logger.info(f"Model trained. AUC: {roc_auc:.4f}, Recall (High Risk): {recall_class_1:.4f}")
 
     return pipeline, feature_names, df_with_predictions, roc_auc, recall_class_1, shap_df
 
@@ -188,19 +241,15 @@ def get_model_and_shap_data(df):
 
 df = load_data()
 
-# ----------------------------------------------------------------------
-# FIX FOR SyntaxError: expected 'except' or 'finally' block (Around Line 173)
-# The call to get_model_and_shap_data must be inside a properly closed block.
-# ----------------------------------------------------------------------
 model = None
 roc_auc = 0.0
 recall_class_1 = 0.0
-shap_df = pd.DataFrame() # Initialize variables
+shap_df = pd.DataFrame()
 df_with_predictions = pd.DataFrame()
+feature_names = []
 
 if df is not None:
     try:
-        # Line 173 in the original context (now correctly inside a try block)
         model, feature_names, df_with_predictions, roc_auc, recall_class_1, shap_df = get_model_and_shap_data(df.copy())
 
         # Save results to session state
@@ -208,10 +257,15 @@ if df is not None:
         st.session_state['roc_auc'] = roc_auc
         st.session_state['recall_class_1'] = recall_class_1
         st.session_state['shap_df'] = shap_df
+        st.session_state['model'] = model
+        st.session_state['feature_names'] = feature_names
+
         st.success("Model and SHAP data loaded successfully!")
 
+    except ValueError as ve:
+        st.error(f"Data Error: {str(ve)}")
+        logger.error(f"Data Validation Error: {str(ve)}")
     except Exception as e:
-        # This is the required block to prevent the SyntaxError
         st.error(f"FATAL ERROR during model initialization or SHAP calculation: {str(e)}")
         st.warning("Please check the 'get_model_and_shap_data' function and the input data.")
         logger.error(f"FATAL ERROR in model/shap loading: {str(e)}")
@@ -310,10 +364,12 @@ else:
             heat_data = []
             for index, row in risk_by_location.iterrows():
                 branch = row['claim_processing_branch']
-                if branch in branch_coords:
-                    lat, lon = branch_coords[branch]
-                    # Weight the heatmap by risk rate
-                    heat_data.append([lat, lon, row['risk_rate'] * 10])
+                
+                # Use a coordinate for the branch if available, otherwise use 'Other'
+                lat, lon = branch_coords.get(branch, branch_coords['Other'])
+
+                # Weight the heatmap by risk rate
+                heat_data.append([lat, lon, row['risk_rate'] * 10])
                 
                 # Add markers for branches
                 folium.CircleMarker(
@@ -340,10 +396,14 @@ st.subheader("🔍 Real-Time Claim Prediction")
 
 # Collect a random sample for demonstration
 if not df.empty:
+    # Ensure the sample is not empty before accessing iloc[0]
     sample = df.sample(1).iloc[0]
 else:
-    sample = pd.Series(index=df.columns) # Empty series if df is empty
-
+    # Use the original columns for the empty series
+    sample = pd.Series(index=['claim_amount_szl', 'claim_type', 'accident_location', 'cause_of_fire',
+                             'age', 'gender', 'location', 'rural_vs_urban', 'highest_education_level',
+                             'main_income_source', 'policy_premium_szl', 'policy_deductible_szl']) 
+    
 input_cols = [
     'claim_amount_szl', 'claim_type', 'accident_location', 'cause_of_fire',
     'age', 'gender', 'location', 'rural_vs_urban', 'highest_education_level',
@@ -352,49 +412,64 @@ input_cols = [
 
 input_data = {}
 col_input = st.columns(4)
-col_counter = 0
 
 st.markdown("_Modify the values below to see the real-time risk score:_")
 
 for i, feature in enumerate(input_cols):
+    # Ensure the feature exists in the DataFrame
+    if feature not in df.columns:
+        continue
+
     with col_input[i % 4]:
         if df[feature].dtype == 'object':
             options = df[feature].unique().tolist()
+            # Ensure index calculation is safe
+            initial_index = options.index(sample[feature]) if feature in sample and sample[feature] in options else 0
             input_data[feature] = st.selectbox(
                 f"{feature.replace('_', ' ').title()}",
                 options=options,
-                index=options.index(sample[feature]) if sample[feature] in options else 0,
+                index=initial_index,
                 key=f"input_{feature}"
             )
         elif df[feature].dtype in ['int64', 'float64']:
             min_val = df[feature].min()
             max_val = df[feature].max()
+            # Ensure value is within bounds
+            initial_value = float(sample[feature]) if feature in sample else (min_val + max_val) / 2
+            initial_value = max(min_val, min(max_val, initial_value))
+            
             input_data[feature] = st.number_input(
                 f"{feature.replace('_', ' ').title()}",
                 min_value=min_val,
                 max_value=max_val,
-                value=float(sample[feature]),
+                value=initial_value,
                 key=f"input_{feature}"
             )
 
 if st.button("Predict Risk Score"):
     try:
+        if 'model' not in st.session_state or st.session_state['model'] is None:
+            st.error("Model is not loaded. Please ensure data loading and training succeeded.")
+            raise Exception("Model not available in session state.")
+
+        model = st.session_state['model']
+        
         # Create a DataFrame for prediction
         input_df = pd.DataFrame([input_data])
         
-        # Ensure all necessary model input columns are present in the input_df, 
-        # even if they are filled with placeholders/missing values, to match training schema.
-        # This is crucial for the ColumnTransformer in the pipeline.
-        missing_cols = set(df.drop(columns=['risk_flag', 'claim_id', 'customer_id', 'claim_date', 'coverage_type']).columns) - set(input_df.columns)
+        # Determine the base columns used during training
+        X_train_cols_base = df.drop(columns=['risk_flag', 'claim_id', 'customer_id', 'claim_date', 'coverage_type'], errors='ignore').columns.tolist()
+        
+        # Fill missing columns in input_df to match X_train_cols_base
+        missing_cols = set(X_train_cols_base) - set(input_df.columns)
         for col in missing_cols:
             if df[col].dtype == 'object':
                 input_df[col] = 'Missing'
             else:
-                input_df[col] = df[col].mean() # Fill numeric with mean placeholder
+                input_df[col] = df[col].mean()
 
         # Reorder columns to match the trained model's feature space (X)
-        X_train_cols = df.drop(columns=['risk_flag', 'claim_id', 'customer_id', 'claim_date', 'coverage_type']).columns.tolist()
-        input_df = input_df.reindex(columns=X_train_cols, fill_value=0)
+        input_df = input_df.reindex(columns=X_train_cols_base)
 
         # Make prediction
         pred_proba = model.predict_proba(input_df)[:, 1][0]
@@ -406,26 +481,51 @@ if st.button("Predict Risk Score"):
         else:
             st.success("This claim is **LOW RISK** and can proceed normally.")
 
-        # Real-time SHAP explanation (mock for simplicity, but shows the concept)
+        # Real-time SHAP explanation
         st.markdown("##### Local Explanation (Mock SHAP Values)")
-        # This mocks SHAP output by weighting the top 5 global features
-        top_features = shap_df.head(5)['Feature'].tolist()
-        local_explanation = {
-            'Location (Manzini)': 0.15,
-            'Claim Type (Fire)': 0.10,
-            'Age': -0.05,
-            'Policy Premium': 0.03
-        }
         
-        # Generate a small waterfall plot mock
-        explanation_df = pd.DataFrame(list(local_explanation.items()), columns=['Feature', 'Contribution'])
-        fig_waterfall = px.bar(explanation_df.sort_values('Contribution'), 
-                               x='Contribution', 
-                               y='Feature', 
-                               orientation='h',
-                               title="Feature Contribution to Risk Score")
-        st.plotly_chart(fig_waterfall, use_container_width=True)
-        st.caption("The mock explanation shows how key features push the risk score up or down.")
+        # Use the preprocessor from the model pipeline to transform the single input sample
+        preprocessor = model['preprocessor']
+        input_transformed = preprocessor.transform(input_df)
+        
+        # Get the classifier component
+        classifier = model['classifier']
+        
+        # Only use TreeExplainer if the classifier supports it (RandomForest does)
+        explainer = shap.TreeExplainer(classifier)
+        
+        # Calculate SHAP values for the single transformed input
+        shap_values_input = explainer.shap_values(input_transformed)
+        
+        if isinstance(shap_values_input, list):
+            shap_values_input_target = shap_values_input[1][0] # Get values for class 1
+        else:
+            shap_values_input_target = shap_values_input[0]
+            
+        # Get feature names from session state (created in get_model_and_shap_data)
+        feature_names_shap = st.session_state.get('feature_names', [])
+        
+        if len(feature_names_shap) == len(shap_values_input_target):
+            # Create DataFrame for local explanation
+            local_shap_df = pd.DataFrame({
+                'Feature': feature_names_shap,
+                'Contribution': shap_values_input_target
+            }).sort_values(by='Contribution', key=abs, ascending=False).head(10)
+            
+            # Generate a waterfall plot for local explanation 
+            fig_waterfall = px.bar(local_shap_df, 
+                                x='Contribution', 
+                                y='Feature', 
+                                orientation='h',
+                                title="Feature Contribution to Predicted Risk Score",
+                                color=local_shap_df['Contribution'] > 0,
+                                color_discrete_map={True: 'red', False: 'blue'})
+            
+            st.plotly_chart(fig_waterfall, use_container_width=True)
+            st.caption("This visualization shows the exact feature contributions pushing the predicted score up (red) or down (blue).")
+        else:
+            st.warning("Could not generate local SHAP plot due to feature count mismatch.")
+
 
     except Exception as e:
         st.error(f"Prediction failed: {str(e)}. Ensure the model is loaded correctly.")
@@ -493,7 +593,12 @@ if not df_with_predictions.empty:
             )
 
     with col11:
-        pdf_buffer = generate_pdf_report(roc_auc, recall_class_1, shap_df)
+        # Use the latest metrics from session state if available
+        current_roc_auc = st.session_state.get('roc_auc', 0.0)
+        current_recall = st.session_state.get('recall_class_1', 0.0)
+        current_shap_df = st.session_state.get('shap_df', pd.DataFrame())
+        
+        pdf_buffer = generate_pdf_report(current_roc_auc, current_recall, current_shap_df)
         st.download_button(
             "Download PDF Report", 
             data=pdf_buffer, 
