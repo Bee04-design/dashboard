@@ -530,11 +530,16 @@ def main():
 
         
         # --- NEW GRAPH: BOOTSTRAPPED FORESTED LINE GRAPH ---
+        
+        # Filter data for plotting (FIXED: Use combined_df to access 'Risk_Rate_Pct')
+        hist_plot_data = combined_df[combined_df['Type'] == 'Historical'].copy()
+        mean_plot_data = combined_df[combined_df['Type'] == 'Forecast (Mean)'].copy()
+        
         fig_bootstrap = go.Figure()
         
-        # 1. Historical Trend
+        # 1. Historical Trend (Now using hist_plot_data with the correct column)
         fig_bootstrap.add_trace(go.Scatter(
-            x=hist_data['Month_Year'], y=hist_data['Risk_Rate_Pct'],
+            x=hist_plot_data['Month_Year'], y=hist_plot_data['Risk_Rate_Pct'],
             mode='lines+markers', name='Historical Risk Rate',
             line=dict(color='#00FF9D', width=2)
         ))
@@ -555,9 +560,9 @@ def main():
             showlegend=True
         ))
         
-        # 3. Mean Forecast Line
+        # 3. Mean Forecast Line (Now using mean_plot_data with the correct column)
         fig_bootstrap.add_trace(go.Scatter(
-            x=mean_forecast['Month_Year'], y=mean_forecast['Risk_Rate_Pct'],
+            x=mean_plot_data['Month_Year'], y=mean_plot_data['Risk_Rate_Pct'],
             mode='lines+markers', name='Mean Forecast',
             line=dict(color='#FF2B2B', width=3, dash='dash')
         ))
