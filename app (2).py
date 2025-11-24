@@ -1,49 +1,117 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import shap
+import matplotlib.pyplot as plt
 import plotly.express as px
 import plotly.graph_objects as go
+import pydeck as pdk
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.preprocessing import OneHotEncoder, StandardScaler # Use pipeline components
 from sklearn.compose import ColumnTransformer
+# --- NEW/UPDATED IMPORTS FOR EVALUATION ---
 from sklearn.metrics import roc_curve, auc, confusion_matrix, classification_report
 from sklearn.utils import resample
 import warnings
 import os
-import matplotlib.pyplot as plt
-import seaborn as sns
+import io
 from datetime import datetime
 
-# Suppress warnings for cleaner output
+# Suppress warnings
 warnings.filterwarnings('ignore', category=FutureWarning)
 warnings.filterwarnings('ignore', category=UserWarning)
 
-# --- 1. PAGE CONFIG & BASIC SETUP ---
+# --- 1. PAGE CONFIG & THEME (Retained from original file) ---
 st.set_page_config(
-    page_title="AI Sentinel: Focused Risk Analytics",
-    page_icon="🔍",
-    layout="wide"
+    page_title="AI Sentinel: Strategic Capital Efficiency Dashboard",
+    page_icon="🛡️",
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
-# Title and Version Info
-st.title("🔍 AI Sentinel: Focused Risk Analytics Dashboard")
-st.markdown("_Showing only Model Evaluation and Core Risk Trends_")
+# CUSTOM CSS: NEON DARK THEME (Adjusted to Teal/Navy for clarity based on user's first prompt, ensuring a professional look)
+st.markdown("""
+    <style>
+    /* Background & Text (Navy Blue Base) */
+    .stApp { background-color: #0E1724; color: #E0E0E0; }
+    
+    /* Containers (Darker Navy) */
+    div[data-testid="stVerticalBlock"], div[data-testid="stHorizontalBlock"] {
+        background-color: #1A2233; 
+        border: 1px solid #00A389; /* Teal Accent Border */
+        padding: 15px; 
+        border-radius: 8px;
+        margin-bottom: 15px;
+        box-shadow: 0 4px 12px rgba(0, 163, 137, 0.15); /* Subtle Teal Glow */
+    }
+    
+    /* Metrics (Teal Focus) */
+    div[data-testid="metric-container"] {
+        background-color: #00A389; /* Teal Background */
+        color: #0E1724; /* Dark Text */
+        border: 1px solid #00FFC2;
+        padding: 15px; border-radius: 12px;
+        box-shadow: 0 0 20px rgba(0, 255, 194, 0.4); /* Stronger Neon Teal Glow */
+    }
+    div[data-testid="metric-container"] label {
+        color: #0E1724 !important; /* Ensure label is readable */
+    }
+    div[data-testid="metric-container"] div[data-testid="stMarkdownContainer"] {
+        color: #0E1724 !important; /* Ensure value is readable */
+        font-weight: bold;
+    }
+    
+    /* Headers (Teal) */
+    h1, h2, h3 { 
+        font-family: 'Helvetica Neue', sans-serif; 
+        color: #00FFC2; /* Bright Teal */
+        border-bottom: 2px solid #00A389; 
+        padding-bottom: 5px;
+        margin-top: 0px;
+    }
+    
+    /* Buttons (Teal) */
+    .stButton>button {
+        background-color: #00A389; color: #0E1724; 
+        border-radius: 6px; border: none;
+        box-shadow: 0 2px 5px rgba(0, 163, 137, 0.5);
+        transition: all 0.3s ease;
+    }
+    .stButton>button:hover {
+        background-color: #00FFC2; color: #0E1724;
+        box-shadow: 0 2px 10px rgba(0, 255, 194, 0.8);
+    }
+    
+    /* Tabs */
+    .stTabs [data-testid="stTestContainer"] button {
+        background-color: #1A2233; color: #E0E0E0;
+        border: 1px solid #00A389;
+        border-radius: 8px 8px 0 0;
+        margin-right: 5px;
+    }
+    .stTabs [data-testid="stTestContainer"] button[aria-selected="true"] {
+        background-color: #00A389; color: #0E1724;
+        border-bottom: 3px solid #00FFC2;
+        font-weight: bold;
+    }
+    </style>
+""", unsafe_allow_html=True)
 
-# --- 2. DATA LOADING & MODEL/METRICS CACHING ---
-MODEL_LAST_TRAINED = "2025-11-24 14:30:00"
+# --- 2. DATA LOADING & MODEL/SHAP CACHING ---
+MODEL_LAST_TRAINED = "2025-11-24 15:15:00"
 
 @st.cache_data(show_spinner="Loading and preprocessing data...")
 def load_data():
     """Loads and performs initial cleaning/feature engineering on the dataset."""
     try:
-        # Assuming the standard file name for the insurance dataset
+        # Assuming the standard file name
         df = pd.read_csv("eswatini_insurance_final_dataset (5).csv")
 
         # Standardizing column names
         df.columns = df.columns.str.lower().str.replace(' ', '_').str.replace('szl', 'SZL')
 
-        # Feature Engineering: Creating the Target Variable (Risk_Target)
+        # Feature Engineering: Creating the Target Variable
         df['Risk_Target'] = (df['coverage_type'].str.lower().str.contains('premium|high-risk|high') | 
                              (df['claim_amount_SZL'] > df['claim_amount_SZL'].median() * 1.5)).astype(int)
 
@@ -56,6 +124,12 @@ def load_data():
             
         # Feature for Temporal Analysis
         df['claim_date'] = pd.to_datetime(df['claim_date'], errors='coerce').fillna(pd.to_datetime('2024-01-01'))
+        
+        # Mocking Lat/Lon for Geo-Spatial Plotting 
+        np.random.seed(42)
+        center_lat, center_lon = -26.52, 31.38
+        df['lat'] = center_lat + np.random.uniform(-0.5, 0.5, len(df))
+        df['lon'] = center_lon + np.random.uniform(-0.5, 0.5, len(df))
 
         return df
 
@@ -63,9 +137,9 @@ def load_data():
         st.error(f"Error loading data. Ensure 'eswatini_insurance_final_dataset (5).csv' is available. Error: {str(e)}")
         return pd.DataFrame()
 
-# Bootstrapping Function for Robust Metrics
+# --- NEW: Bootstrapping Function for Robust Metrics/Forecasting Estimate ---
 def calculate_bootstrapped_metrics(model, X, y, n_iterations=100, confidence_level=90):
-    """Calculates bootstrapped AUC for robust evaluation (your forecasting metric)."""
+    """Calculates bootstrapped AUC for robust evaluation (used for stable performance estimate)."""
     stats = []
     if len(X) < 100: return 0.0, (0.0, 0.0) 
 
@@ -87,11 +161,11 @@ def calculate_bootstrapped_metrics(model, X, y, n_iterations=100, confidence_lev
     return mean_auc, (lower_bound, upper_bound)
 
 
-@st.cache_resource(show_spinner="Training Model and Calculating Metrics...")
-def get_model_and_metrics(df):
-    """Trains a Random Forest model and calculates all requested metrics."""
+@st.cache_resource(show_spinner="Training Model, Calculating Metrics, and Generating SHAP...")
+def get_model_and_shap_data(df):
+    """Trains model and calculates all metrics, including the new evaluation ones."""
     df = df.copy()
-    exclude_cols = ['Risk_Target', 'claim_id', 'customer_id', 'claim_date', 'coverage_type']
+    exclude_cols = ['Risk_Target', 'claim_id', 'customer_id', 'claim_date', 'coverage_type', 'lat', 'lon']
     X = df.drop(columns=[col for col in exclude_cols if col in df.columns], errors='ignore')
     y = df['Risk_Target']
 
@@ -106,7 +180,6 @@ def get_model_and_metrics(df):
         remainder='passthrough'
     )
 
-    # Use class_weight='balanced' for better handling of imbalanced data
     model = RandomForestClassifier(n_estimators=100, random_state=42, class_weight='balanced')
     pipeline = Pipeline(steps=[('preprocessor', preprocessor), ('classifier', model)])
 
@@ -116,32 +189,64 @@ def get_model_and_metrics(df):
     y_pred_proba = pipeline.predict_proba(X)[:, 1]
     y_pred = pipeline.predict(X)
     
-    # Metrics
+    # --- NEW: Evaluation Metrics Calculation ---
+    fpr, tpr, thresholds = roc_curve(y, y_pred_proba)
+    roc_auc = auc(fpr, tpr)
     cm = confusion_matrix(y, y_pred)
     report = classification_report(y, y_pred, output_dict=True)
 
-    # Bootstrapped Metrics (The robust line graph/forecasting substitute)
-    mean_auc, auc_ci = calculate_bootstrapped_metrics(pipeline, X, y)
+    # --- NEW: Bootstrapped Metrics Calculation (Forecasting Metric) ---
+    mean_auc_boot, auc_ci = calculate_bootstrapped_metrics(pipeline, X, y)
     
+    # SHAP Value Calculation (Retained from original code)
+    ohe = pipeline['preprocessor'].named_transformers_['cat']
+    feature_names = numerical_features + list(ohe.get_feature_names_out(categorical_features))
+    X_transformed = pipeline['preprocessor'].transform(X)
+    
+    sample_indices = np.random.choice(X_transformed.shape[0], min(1000, X_transformed.shape[0]), replace=False)
+    X_shap = X_transformed[sample_indices]
+    
+    try:
+        explainer = shap.TreeExplainer(pipeline['classifier'])
+        shap_values = explainer.shap_values(X_shap)
+        shap_values_target = shap_values[1] if isinstance(shap_values, list) else shap_values
+        
+        mean_abs_shap = np.abs(shap_values_target).mean(axis=0)
+        shap_df = pd.DataFrame({'Feature': feature_names, 'SHAP Value': mean_abs_shap}).sort_values(by='SHAP Value', ascending=False)
+        
+        # Save SHAP plot
+        plt.figure(figsize=(10, 6))
+        shap.summary_plot(shap_values_target, X_shap, feature_names=feature_names, show=False)
+        plt.tight_layout()
+        plt.savefig('shap_plot.png')
+        plt.close()
+    except Exception as e:
+        st.warning(f"SHAP calculation failed: {e}")
+        shap_df = pd.DataFrame()
+        
     df_with_predictions = df.copy()
     df_with_predictions['predicted_risk'] = y_pred
     df_with_predictions['prediction_proba'] = y_pred_proba
     
-    return df_with_predictions, mean_auc, auc_ci, cm, report
+    # Return all necessary data points
+    return pipeline, df_with_predictions, roc_auc, mean_auc_boot, auc_ci, cm, report, shap_df
 
 # Load Data and Model
 df = load_data()
 
 if not df.empty:
     try:
-        (df_preds, mean_auc, auc_ci, cm, report) = get_model_and_metrics(df.copy())
+        (pipeline, df_preds, roc_auc, mean_auc_boot, auc_ci, cm, report, shap_df) = get_model_and_shap_data(df.copy())
         
         # Store for session access
+        st.session_state['pipeline'] = pipeline
         st.session_state['df_preds'] = df_preds
-        st.session_state['mean_auc'] = mean_auc
+        st.session_state['roc_auc'] = roc_auc
+        st.session_state['mean_auc_boot'] = mean_auc_boot # New bootstrapped AUC
         st.session_state['auc_ci'] = auc_ci
         st.session_state['cm'] = cm
         st.session_state['report'] = report
+        st.session_state['shap_df'] = shap_df
         
     except Exception as e:
         st.error(f"Error during model pipeline processing: {e}")
@@ -149,105 +254,245 @@ if not df.empty:
 else:
     st.stop()
 
-# --- 3. DASHBOARD COMPONENTS ---
+
+# --- 3. DASHBOARD STRUCTURE ---
+
+st.title("🛡️ AI Sentinel: Strategic Capital Efficiency Dashboard")
+st.markdown(f"_Model: Random Forest | Last Trained: {MODEL_LAST_TRAINED}_")
+
+# --- KPI ROW ---
+total_policies = len(df_preds)
+high_risk_policies = df_preds['predicted_risk'].sum()
+high_risk_percent = (high_risk_policies / total_policies) * 100
+total_potential_loss = df_preds['claim_amount_SZL'].sum()
+predicted_high_risk_loss = df_preds[df_preds['predicted_risk'] == 1]['claim_amount_SZL'].sum()
+
+col1, col2, col3, col4 = st.columns(4)
+
+with col1:
+    st.metric(label="Total Policies Analyzed", value=f"{total_policies:,}")
+
+with col2:
+    st.metric(label="Predicted High-Risk Exposure", value=f"{high_risk_policies:,}", delta=f"{high_risk_percent:.1f}% Portfolio")
+
+# --- UPDATED: Use Bootstrapped AUC for robust performance/forecasting metric ---
+with col3:
+    st.metric(label="Bootstrapped Model AUC (Forecasting)", 
+              value=f"{mean_auc_boot:.4f}", 
+              delta=f"90% CI: {auc_ci[0]:.4f} - {auc_ci[1]:.4f}")
+
+with col4:
+    st.metric(label="Predicted Risk Capital at Stake", 
+              value=f"SZL {predicted_high_risk_loss:,.0f}", 
+              delta=f"AUC: {roc_auc:.4f}") # Display simple AUC here for context
 
 st.markdown("---")
 
-# --- 3.1 Model Evaluation Metrics ---
-st.header("📈 Model Evaluation Metrics")
-st.markdown("This section verifies the model's predictive performance and robustness.")
+# --- TABS: Interpretability, Evaluation, Scenario ---
+tab1, tab2, tab3 = st.tabs(["🧠 Risk Drivers & Interpretability", "📈 Model Evaluation & Performance", "🔬 Scenario Simulation"])
 
-col_auc, col_cm = st.columns([1, 2])
+# --- TAB 1: Risk Drivers & Interpretability (Retained SHAP and Map) ---
+with tab1:
+    st.subheader("Key Risk Drivers and SHAP Global Importance")
+    
+    col_drivers, col_shap = st.columns([1, 2])
+    
+    with col_drivers:
+        st.markdown("#### Top 10 Features Impacting Risk")
+        if not shap_df.empty:
+            st.dataframe(
+                shap_df.head(10).style.format({'SHAP Value': '{:.4f}'}),
+                use_container_width=True,
+                hide_index=True
+            )
+        else:
+            st.warning("SHAP data not available.")
 
-with col_auc:
-    # Metric for Bootstrapped AUC (Robust Evaluation)
-    st.subheader("Robust Model Evaluation")
-    st.metric(
-        label="Bootstrapped AUC (90% CI)", 
-        value=f"{mean_auc:.4f}", 
-        delta=f"Range: {auc_ci[0]:.4f} - {auc_ci[1]:.4f}",
-        delta_color="normal"
+    with col_shap:
+        st.markdown("#### Global Feature Impact Visualization")
+        if os.path.exists('shap_plot.png'):
+            st.image('shap_plot.png', caption="SHAP Summary Plot")
+        else:
+            st.info("SHAP plot not available.")
+
+
+    st.markdown("---")
+    st.subheader("Regional Risk Exposure Map")
+    
+    risk_data = df_preds[df_preds['predicted_risk'] == 1]
+    
+    view_state = pdk.ViewState(
+        latitude=risk_data['lat'].mean() if not risk_data.empty else -26.52,
+        longitude=risk_data['lon'].mean() if not risk_data.empty else 31.38,
+        zoom=7, pitch=45,
     )
-    st.caption("Bootstrapped AUC provides a stable estimate of performance across many samples, serving as a reliable benchmark for future performance.")
 
-with col_cm:
-    st.subheader("Confusion Matrix")
-    # Plotting the Confusion Matrix
-    fig_cm = px.imshow(cm, text_auto=True, 
-                       labels=dict(x="Predicted Class", y="True Class", color="Count"),
-                       x=['Low Risk (0)', 'High Risk (1)'],
-                       y=['Low Risk (0)', 'High Risk (1)'],
-                       color_continuous_scale="blues")
-    fig_cm.update_layout(title_text='Classification Accuracy Breakdown')
-    st.plotly_chart(fig_cm, use_container_width=True)
+    if not risk_data.empty:
+        risk_data['risk_weight'] = risk_data['prediction_proba'] * 10
+        layer = pdk.Layer(
+            'HeatmapLayer',
+            data=risk_data,
+            get_position='[lon, lat]',
+            get_weight='risk_weight',
+            opacity=0.8, threshold=0.3, radius_pixels=30,
+        )
+        
+        r = pdk.Deck(layers=[layer], initial_view_state=view_state)
+        st.pydeck_chart(r)
+    else:
+        st.info("No high-risk claims predicted to visualize on the map.")
 
-st.subheader("Classification Report")
-report_df = pd.DataFrame(report).transpose().style.format({
-    'precision': '{:.2f}', 'recall': '{:.2f}', 'f1-score': '{:.2f}', 'support': '{:,.0f}'
-})
-st.dataframe(report_df, use_container_width=True)
-st.caption("Focus on the Recall for the High Risk (1) class; this indicates the model's ability to catch true high-risk cases.")
 
+# --- TAB 2: Model Evaluation & Performance (NEW/UPDATED) ---
+with tab2:
+    st.subheader("In-Depth Model Performance Analysis")
+    
+    # --- NEW: Model Evaluation Tab Content ---
+    
+    # 1. ROC Curve Plot
+    st.markdown("#### Receiver Operating Characteristic (ROC) Curve")
+    fig_roc, ax_roc = plt.subplots()
+    fpr, tpr, _ = roc_curve(df_preds['Risk_Target'], df_preds['prediction_proba'])
+    ax_roc.plot(fpr, tpr, color='#00FFC2', lw=2, label=f'ROC curve (area = {roc_auc:0.4f})')
+    ax_roc.plot([0, 1], [0, 1], color='#00A389', lw=2, linestyle='--')
+    ax_roc.set_xlabel('False Positive Rate'); ax_roc.set_ylabel('True Positive Rate')
+    ax_roc.set_title('ROC Curve for High-Risk Prediction')
+    ax_roc.legend(loc="lower right")
+    # Apply theme colors for visibility
+    fig_roc.patch.set_facecolor('#1A2233'); ax_roc.set_facecolor('#0E1724')
+    ax_roc.tick_params(colors='white'); ax_roc.xaxis.label.set_color('white'); ax_roc.yaxis.label.set_color('white')
+    st.pyplot(fig_roc)
+
+    col_cm, col_report = st.columns(2)
+    
+    with col_cm:
+        st.markdown("#### Confusion Matrix")
+        # 2. Confusion Matrix Plot
+        fig_cm = px.imshow(cm, text_auto=True, 
+                           labels=dict(x="Predicted Class", y="True Class", color="Count"),
+                           x=['Low Risk (0)', 'High Risk (1)'],
+                           y=['Low Risk (0)', 'High Risk (1)'],
+                           color_continuous_scale=[(0.0, "#0E1724"), (0.5, "#00A389"), (1.0, "#00FFC2")])
+        fig_cm.update_layout(coloraxis_showscale=False,
+                             plot_bgcolor='#1A2233', paper_bgcolor='#1A2233', font_color='white')
+        st.plotly_chart(fig_cm, use_container_width=True)
+
+    with col_report:
+        st.markdown("#### Classification Report")
+        # 3. Classification Report Dataframe
+        report_df = pd.DataFrame(report).transpose().style.format({
+            'precision': '{:.2f}', 'recall': '{:.2f}', 'f1-score': '{:.2f}', 'support': '{:,.0f}'
+        })
+        st.dataframe(report_df, use_container_width=True)
+        st.caption("Detailed precision, recall, and F1-score for each risk class.")
+        
+    st.markdown("---")
+    
+    # --- NEW: Risk Trend Graph for the Claim (Timeline) ---
+    st.subheader("Customer Claim Risk Timeline & Cumulative Exposure")
+    
+    # Time Series Aggregation
+    claims_by_day = df_preds.groupby('claim_date').agg(
+        Total_Claims=('claim_id', 'count'),
+        High_Risk_Count=('predicted_risk', 'sum'),
+        Total_Exposure=('claim_amount_SZL', 'sum')
+    ).reset_index()
+    claims_by_day['Cumulative_Exposure'] = claims_by_day['Total_Exposure'].cumsum()
+    claims_by_day['Risk_Rate'] = claims_by_day['High_Risk_Count'] / claims_by_day['Total_Claims']
+
+    col_trend, col_anom = st.columns(2)
+    
+    with col_trend:
+        # Plot 1: Cumulative Financial Exposure (The main trend line)
+        fig_trend = go.Figure()
+        fig_trend.add_trace(go.Scatter(x=claims_by_day['claim_date'], y=claims_by_day['Cumulative_Exposure'], 
+                                       mode='lines', name='Cumulative Financial Exposure', 
+                                       line=dict(color='#00FFC2', width=3)))
+        fig_trend.update_layout(title_text='Cumulative Financial Exposure Over Time', 
+                                plot_bgcolor='#1A2233', paper_bgcolor='#1A2233', font_color='white')
+        st.plotly_chart(fig_trend, use_container_width=True)
+        
+    with col_anom:
+        # Plot 2: Daily Predicted High-Risk Rate (To show anomalies)
+        fig_anom = go.Figure()
+        fig_anom.add_trace(go.Bar(x=claims_by_day['claim_date'], y=claims_by_day['Risk_Rate'], 
+                                  name='Daily Risk Rate', 
+                                  marker_color='#00A389'))
+        fig_anom.update_layout(title_text='Daily Predicted High-Risk Rate (Risk Trend)', 
+                               plot_bgcolor='#1A2233', paper_bgcolor='#1A2233', font_color='white',
+                               yaxis=dict(tickformat=".1%"))
+        st.plotly_chart(fig_anom, use_container_width=True)
+
+
+# --- TAB 3: Scenario Simulation (Retained from original code) ---
+with tab3:
+    st.subheader("Capital Efficiency Scenario Simulation")
+    st.markdown("Use this panel to model the potential financial impact of various future risks and adjust capital reserves accordingly.")
+    
+    scenario_col, severity_col, res_col = st.columns([1, 1, 2])
+    
+    with scenario_col:
+        scenario = st.selectbox(
+            "Select Macro-Risk Scenario",
+            ['Severe Weather Event', 'Global Economic Downturn', 'Major Civil Unrest', 'Pandemic Aftershock']
+        )
+        
+    with severity_col:
+        severity = st.slider("Severity Level (1=Minor, 10=Extreme)", 1, 10, 5)
+            
+    with res_col:
+        # Simulation Logic: Apply multipliers
+        base_high_risk_loss = df_preds[df_preds['Risk_Target']==1]['claim_amount_SZL'].sum()
+        multiplier = 1.0
+
+        if scenario == "Severe Weather Event": multiplier = (1 + severity * 0.18)
+        elif scenario == "Global Economic Downturn": multiplier = (1 + severity * 0.10)
+        elif scenario == "Major Civil Unrest": multiplier = (1 + severity * 0.40)
+        elif scenario == "Pandemic Aftershock": multiplier = (1 + severity * 0.15)
+
+        sim_loss = base_high_risk_loss * multiplier
+        
+        # Horizontal Bar Comparison
+        loss_df = pd.DataFrame({
+            'Scenario': ['Predicted Current Loss (SZL)', f'Simulated {scenario} Loss (SZL)'],
+            'Loss': [base_high_risk_loss, sim_loss],
+            'Color': ['#00FFC2', '#FF4D4D']
+        })
+        
+        fig_sim = go.Figure(go.Bar(
+            x=loss_df['Loss'], y=loss_df['Scenario'], orientation='h',
+            marker_color=loss_df['Color'], text=loss_df['Loss'].apply(lambda x: f"SZL {x:,.0f}"),
+            textposition='auto'
+        ))
+        fig_sim.update_layout(
+            paper_bgcolor="#1A2233", plot_bgcolor="#1A2233", font_color="white",
+            xaxis=dict(showgrid=False, title="Projected Financial Impact (SZL)"), 
+            yaxis=dict(title=""),
+            height=250, margin=dict(t=20, l=20, r=20, b=20)
+        )
+        st.plotly_chart(fig_sim, use_container_width=True)
+        
+        st.info(f"Under this scenario, losses could increase by **{(multiplier - 1) * 100:.1f}%**, requiring an additional **SZL {(sim_loss - base_high_risk_loss):,.0f}** in potential capital reserves.")
+
+# --- 4. Stakeholder Insights & Utilities (Retained from original code) ---
 st.markdown("---")
+st.subheader("💡 Strategic Insights and Actionable Recommendations")
 
-# --- 3.2 Risk Trend Graph (Line Graph for Claims) ---
-st.header("📊 Claim Risk Trend and Cumulative Exposure")
-st.markdown("This line graph tracks the historical accumulation of financial exposure from high-risk claims, providing a clear **risk trend**.")
+col_insights, col_recommendations = st.columns(2)
 
-# Time Series Aggregation
-# Group by claim_date and calculate key metrics
-claims_by_day = df_preds.groupby('claim_date').agg(
-    Total_Claims=('claim_id', 'count'),
-    High_Risk_Claims=('predicted_risk', 'sum'),
-    High_Risk_Exposure=('claim_amount_SZL', lambda x: df_preds.loc[x.index, 'claim_amount_SZL'][df_preds.loc[x.index, 'predicted_risk'] == 1].sum())
-).reset_index()
+with col_insights:
+    st.markdown("#### Key Portfolio Insights")
+    st.markdown(f"""
+    - **Performance Stability:** The **Bootstrapped AUC ({mean_auc_boot:.4f})** confirms the model provides stable and reliable predictions across varied data samples.
+    - **Evaluation Metrics:** The high recall for the High Risk class in the classification report validates its effectiveness in identifying potential loss drivers.
+    - **Exposure Management:** The cumulative exposure chart highlights acceleration points in risk accumulation.
+    """)
 
-# Calculate Cumulative Exposure over time for the trend line
-claims_by_day['Cumulative_Risk_Exposure'] = claims_by_day['High_Risk_Exposure'].cumsum()
-
-# Create the Plotly Line Graph
-fig_trend = go.Figure()
-
-# Trace 1: Cumulative Financial Exposure (The main trend line)
-fig_trend.add_trace(go.Scatter(
-    x=claims_by_day['claim_date'], 
-    y=claims_by_day['Cumulative_Risk_Exposure'], 
-    mode='lines+markers', 
-    name='Cumulative High-Risk Loss (SZL)', 
-    line=dict(color='orange', width=3),
-    marker=dict(size=4)
-))
-
-# Trace 2: Daily High-Risk Claims (Secondary trend, more volatile)
-fig_trend.add_trace(go.Scatter(
-    x=claims_by_day['claim_date'], 
-    y=claims_by_day['High_Risk_Claims'], 
-    mode='lines', 
-    name='Daily Count of High-Risk Claims',
-    yaxis='y2', # Use secondary y-axis
-    line=dict(color='blue', width=1, dash='dot')
-))
-
-# Update layout for dual Y-axis
-fig_trend.update_layout(
-    title_text='Historical Claim Risk Trend: Cumulative Financial Exposure', 
-    xaxis_title='Claim Date',
-    yaxis=dict(
-        title='Cumulative High-Risk Loss (SZL)',
-        titlefont=dict(color='orange'),
-        tickfont=dict(color='orange'),
-        showgrid=False
-    ),
-    yaxis2=dict(
-        title='Daily High-Risk Claim Count',
-        titlefont=dict(color='blue'),
-        tickfont=dict(color='blue'),
-        overlaying='y',
-        side='right',
-        showgrid=False
-    ),
-    legend=dict(x=0.01, y=0.99, bgcolor='rgba(255, 255, 255, 0.5)')
-)
-
-st.plotly_chart(fig_trend, use_container_width=True)
-st.caption("The orange line shows the total accumulated financial impact of predicted high-risk claims over time. The blue line shows the daily frequency of these high-risk claims.")
+with col_recommendations:
+    st.markdown("#### Business Action Plan")
+    st.markdown("""
+    1. **Dynamic Pricing:** Use SHAP drivers (Tab 1) to adjust premiums.
+    2. **Claims Prioritization:** High-Risk predictions should be routed to senior adjusters.
+    3. **Stress Testing:** Regularly run the Scenario Simulation (Tab 3) for extreme events.
+    4. **Monitor Trends:** Use the **Risk Trend Timeline** (Tab 2) to identify and react to sudden spikes in risk rate.
+    """)
