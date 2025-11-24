@@ -37,7 +37,7 @@ warnings.filterwarnings("ignore")
 # ----------------------
 # CONFIG
 # ----------------------
-DATA_PATH = "/mnt/data/eswatini_insurance_final_dataset (5).csv"  # Change if necessary
+DATA_PATH = "eswatini_insurance_final_dataset (5).csv"  # Change if necessary
 PAGE_TITLE = "AI Sentinel — Explainable Risk Dashboard (Teal + Navy)"
 
 st.set_page_config(page_title=PAGE_TITLE, layout="wide", initial_sidebar_state="expanded", page_icon="🛡️")
