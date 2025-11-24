@@ -6,3 +6,5 @@ shap
 matplotlib
 plotly
 pydeck
+folium
+seaborn
