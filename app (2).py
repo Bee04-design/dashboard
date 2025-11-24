@@ -99,7 +99,9 @@ def load_data():
     else:
         df['Risk_Target'] = (df['claim_amount_SZL'] >= df['claim_amount_SZL'].quantile(0.75)).astype(int)
     
-    if df['Risk_Target'].nunique() < 2: df.loc[df.sample(10).index, 'Risk_Target'] = 1
+    # Safety check for target classes
+    if df['Risk_Target'].nunique() < 2: 
+        df.loc[df.sample(10).index, 'Risk_Target'] = 1
         
     # 2. Dates & IDs
     if 'claim_date' not in df.columns: df['claim_date'] = pd.date_range(end='2024-01-01', periods=len(df), freq='D')
@@ -119,7 +121,7 @@ def load_data():
     df['lat'] = df['lat'].fillna(-26.50)
     df['lon'] = df['lon'].fillna(31.36)
 
-    # 4. Segmentation (Fixing the previous KeyError)
+    # 4. Segmentation (Run here to avoid KeyError later)
     numeric_cols = df.select_dtypes(include=['int64', 'float64']).columns
     cluster_cols = [c for c in numeric_cols if c not in ['Risk_Target', 'claim_id', 'customer_id', 'lat', 'lon']]
     
@@ -201,6 +203,7 @@ def main():
     model, encoders, global_imp, metrics = train_models(df, feature_cols)
     
     # --- EXECUTIVE SUMMARY BANNER ---
+    st.title("🛡️ AI Sentinel: Strategic Capital Efficiency")
     c1, c2, c3, c4 = st.columns(4)
     total_risk = df['Risk_Target'].sum()
     total_val = df[df['Risk_Target']==1]['claim_amount_SZL'].sum()
@@ -215,7 +218,8 @@ def main():
     # --- SIDEBAR INPUT ---
     st.sidebar.header("🔍 Claim Investigator")
     customer_ids = df['customer_id'].unique()
-    selected_cust_id = st.sidebar.selectbox("Select Customer ID", customer_ids[:100])
+    # Ensuring unique key for the selectbox to avoid duplicates error
+    selected_cust_id = st.sidebar.selectbox("Select Customer ID", customer_ids[:100], key="cust_select")
     
     # Get Data
     cust_data = df[df['customer_id'] == selected_cust_id]
@@ -229,16 +233,29 @@ def main():
     enc_df = input_df.copy()
     for col, le in encoders.items():
         val = str(enc_df[col].iloc[0])
-        enc_df[col] = le.transform([val if val in le.classes_ else le.classes_[0]])
+        if val in le.classes_:
+            enc_df[col] = le.transform([val])
+        else:
+            enc_df[col] = le.transform([le.classes_[0]])
 
     base_prob = model.predict_proba(enc_df)[0][1]
     
     # SHAP
     explainer = shap.TreeExplainer(model)
-    shap_values = explainer.shap_values(enc_df)
-    if isinstance(shap_values, list): sv = shap_values[1] if len(shap_values) > 1 else shap_values[0]
-    else: sv = shap_values[..., 1] if len(shap_values.shape) > 2 else shap_values
-    if len(sv.shape) > 1: sv = sv[0] # Flatten
+    shap_values_result = explainer.shap_values(enc_df)
+    
+    # Robust SHAP extraction logic
+    if isinstance(shap_values_result, list):
+        if len(shap_values_result) > 1:
+            sv = shap_values_result[1]
+        else:
+            sv = shap_values_result[0]
+    else:
+        sv = shap_values_result
+        if len(sv.shape) > 1 and sv.shape[1] > 1: # Check if it's (1, features, classes)
+             sv = sv[..., 1]
+
+    if len(sv.shape) > 1: sv = sv[0] # Flatten to 1D array
     
     contrib_df = pd.DataFrame({'Feature': input_df.columns, 'SHAP': sv}).sort_values(by='SHAP', key=abs, ascending=True)
 
@@ -350,7 +367,7 @@ def main():
         s_col, s_res = st.columns([1, 2])
         
         with s_col:
-            scenario = st.selectbox("Simulation Scenario", ["None", "Severe Weather (Flood)", "Pandemic (Health)", "Economic Crisis"])
+            scenario = st.selectbox("Simulation Scenario", ["None", "Severe Weather (Flood)", "Pandemic (Health)", "Economic Crisis"], key="sim_select")
             severity = st.slider("Severity Impact", 1, 10, 5)
             
         with s_res:
@@ -379,5 +396,4 @@ def main():
                 st.warning(f"⚠️ Projected Capital Impact: **+{(sim_loss-base_loss)/base_loss:.1%}** increase in liability.")
 
 if __name__ == "__main__":
-    main()
     main()
