@@ -2,9 +2,14 @@ streamlit
 pandas
 numpy
 scikit-learn
+imbalanced-learn
 shap
 matplotlib
-plotly
-pydeck
-folium
 seaborn
+plotly-express
+folium
+streamlit-folium
+geopandas
+shapely
+reportlab
+weasyprint
