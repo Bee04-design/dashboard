@@ -516,13 +516,17 @@ def main():
         hist_data, forecast_data = run_bootstrap_simulation(df, model)
 
         # Combine historical and mean forecast for the main trend line
+        
+        # FIX: Calculate percentage column on components before combining and use them directly for plotting
         mean_forecast = forecast_data.groupby('Month_Year')['Risk_Rate'].mean().reset_index()
         mean_forecast['Type'] = 'Forecast (Mean)'
+        mean_forecast['Risk_Rate_Pct'] = mean_forecast['Risk_Rate'] * 100 # New calculation location
         
         hist_data['Type'] = 'Historical'
+        hist_data['Risk_Rate_Pct'] = hist_data['Risk_Rate'] * 100 # New calculation location
         
+        # Now concatenate (optional, but good for completeness)
         combined_df = pd.concat([hist_data, mean_forecast])
-        combined_df['Risk_Rate_Pct'] = combined_df['Risk_Rate'] * 100
         
         # Calculate confidence interval (P25 and P75) from the bootstraps
         p25 = forecast_data.groupby('Month_Year')['Risk_Rate'].quantile(0.25).reset_index().rename(columns={'Risk_Rate': 'P25'})
@@ -531,15 +535,11 @@ def main():
         
         # --- NEW GRAPH: BOOTSTRAPPED FORESTED LINE GRAPH ---
         
-        # Filter data for plotting (FIXED: Use combined_df to access 'Risk_Rate_Pct')
-        hist_plot_data = combined_df[combined_df['Type'] == 'Historical'].copy()
-        mean_plot_data = combined_df[combined_df['Type'] == 'Forecast (Mean)'].copy()
-        
         fig_bootstrap = go.Figure()
         
-        # 1. Historical Trend (Now using hist_plot_data with the correct column)
+        # 1. Historical Trend (Using the updated hist_data directly)
         fig_bootstrap.add_trace(go.Scatter(
-            x=hist_plot_data['Month_Year'], y=hist_plot_data['Risk_Rate_Pct'],
+            x=hist_data['Month_Year'], y=hist_data['Risk_Rate_Pct'],
             mode='lines+markers', name='Historical Risk Rate',
             line=dict(color='#00FF9D', width=2)
         ))
@@ -560,9 +560,9 @@ def main():
             showlegend=True
         ))
         
-        # 3. Mean Forecast Line (Now using mean_plot_data with the correct column)
+        # 3. Mean Forecast Line (Using the updated mean_forecast directly)
         fig_bootstrap.add_trace(go.Scatter(
-            x=mean_plot_data['Month_Year'], y=mean_plot_data['Risk_Rate_Pct'],
+            x=mean_forecast['Month_Year'], y=mean_forecast['Risk_Rate_Pct'],
             mode='lines+markers', name='Mean Forecast',
             line=dict(color='#FF2B2B', width=3, dash='dash')
         ))
