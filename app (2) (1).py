@@ -1,5 +1,4 @@
 import streamlit as st
-import streamlit as st
 import pandas as pd
 import numpy as np
 import shap
@@ -11,6 +10,8 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import LabelEncoder, MinMaxScaler
 from sklearn.cluster import KMeans
 from scipy.stats import ks_2samp
+from sklearn.model_selection import train_test_split # New Import
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, confusion_matrix, roc_curve # New Imports
 import warnings
 
 # Suppress warnings
@@ -90,6 +91,7 @@ def load_data():
     
     df['claim_date'] = pd.to_datetime(df['claim_date'], errors='coerce')
     df['Month_Year'] = df['claim_date'].dt.to_period('M').astype(str)
+    df['Year'] = df['claim_date'].dt.year # Added for better trend simulation
         
     # 3. Geo-Coordinates
     coords = {
@@ -108,8 +110,12 @@ def load_data():
     
     if cluster_cols:
         df_numeric = df[cluster_cols].fillna(0)
+        # Scale data for KMeans stability
+        scaler = MinMaxScaler()
+        df_scaled = scaler.fit_transform(df_numeric)
+        
         kmeans = KMeans(n_clusters=4, random_state=42, n_init='auto')
-        df['segment'] = kmeans.fit_predict(df_numeric).astype(str)
+        df['segment'] = kmeans.fit_predict(df_scaled).astype(str)
     else:
         df['segment'] = "0"
     
@@ -135,17 +141,37 @@ def train_models(df):
         le = LabelEncoder()
         X[col] = le.fit_transform(X[col].astype(str))
         encoders[col] = le
+    
+    # 1. Split data for rigorous evaluation (70% train, 30% test)
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.3, random_state=42, stratify=y
+    )
         
     model = RandomForestClassifier(n_estimators=100, max_depth=12, class_weight='balanced', random_state=42)
-    model.fit(X, y)
+    model.fit(X_train, y_train)
     
-    # Global Importance (Fixed for Treemap)
+    # 2. Evaluate model on test set
+    y_pred = model.predict(X_test)
+    y_proba = model.predict_proba(X_test)[:, 1]
+    
+    metrics = {
+        'accuracy': accuracy_score(y_test, y_pred),
+        'precision': precision_score(y_test, y_pred),
+        'recall': recall_score(y_test, y_pred),
+        'f1': f1_score(y_test, y_pred),
+        'roc_auc': roc_auc_score(y_test, y_proba),
+        'conf_matrix': confusion_matrix(y_test, y_pred),
+        'y_test': y_test,
+        'y_proba': y_proba
+    }
+        
+    # Global Importance
     global_imp = pd.DataFrame({
         'Feature': feature_cols,
         'Importance': model.feature_importances_
     }).sort_values(by='Importance', ascending=False)
     
-    return model, encoders, global_imp
+    return model, encoders, global_imp, metrics # Return metrics
 
 # --- 4. HELPER: RADAR CHART DATA ---
 def get_radar_data(df, input_row):
@@ -167,12 +193,89 @@ def get_radar_data(df, input_row):
         'Legit_Avg': [avg_legit[c]/max_vals[c] for c in cols]
     }
 
-# --- 5. MAIN APP ---
+# --- 5. HELPER: BOOTSTRAP SIMULATION ---
+@st.cache_data(show_spinner="Running Bootstrap Simulations...", hash_funcs={RandomForestClassifier: lambda _: 'fixed_model_hash'})
+def run_bootstrap_simulation(df, model, n_bootstraps=50):
+    """
+    Simulates future risk trend using a bootstrapped approach.
+    """
+    
+    # 1. Predict Risk for all historical data
+    feature_cols = ['claim_type', 'location', 'claim_amount_SZL', 'rural_vs_urban', 
+                    'policy_premium_SZL', 'policy_maturity_years', 'segment']
+    X = df[feature_cols].copy()
+    
+    # Re-encode categorical features
+    # NOTE: Calling train_models here is inefficient but guarantees encoders are available
+    _, encoders, _, _ = train_models(df) 
+    for col, le in encoders.items():
+        # Apply transformation with error handling for unseen categories
+        def safe_transform(val):
+            s_val = str(val)
+            if s_val in le.classes_:
+                return le.transform([s_val])[0]
+            # Use the first class as a default fallback for simplicity in simulation
+            return le.transform([le.classes_[0]])[0] 
+            
+        X[col] = X[col].apply(safe_transform)
+        
+    df['Risk_Prob'] = model.predict_proba(X)[..., 1]
+    
+    # 2. Calculate Historical Risk Rate (Monthly)
+    historical_risk_rate = df.groupby('Month_Year')['Risk_Target'].mean().reset_index()
+    historical_risk_rate['Month_Year'] = pd.to_datetime(historical_risk_rate['Month_Year'])
+    historical_risk_rate = historical_risk_rate.rename(columns={'Risk_Target': 'Risk_Rate'})
+    
+    # 3. Forecast Setup
+    last_month = historical_risk_rate['Month_Year'].max()
+    forecast_months = pd.to_datetime([last_month + pd.DateOffset(months=1), last_month + pd.DateOffset(months=2)])
+    
+    # Find the average monthly change (trend)
+    historical_risk_rate['Change'] = historical_risk_rate['Risk_Rate'].diff().fillna(0)
+    avg_trend = historical_risk_rate['Change'].tail(6).mean() # Base trend on last 6 months
+    
+    simulations = []
+    
+    for i in range(n_bootstraps):
+        
+        # Start with historical data
+        sim_df = historical_risk_rate.copy()
+        
+        # Current risk rate
+        current_rate = sim_df['Risk_Rate'].iloc[-1]
+        
+        # Simulate two future months
+        for fm in forecast_months:
+            # Random noise (bootstrapping effect)
+            noise = np.random.normal(0, 0.01) # Small random walk component
+            
+            # Simple Linear Forecast: last_rate + avg_trend + noise
+            next_rate = max(0, min(1, current_rate + avg_trend + noise))
+            
+            # Append to simulation
+            new_row = pd.DataFrame([{'Month_Year': fm, 'Risk_Rate': next_rate, 'Simulation': i}])
+            sim_df = pd.concat([sim_df, new_row], ignore_index=True)
+            current_rate = next_rate # Update current rate for the next step
+            
+        # Store simulation results
+        sim_df['Simulation'] = i
+        simulations.append(sim_df[['Month_Year', 'Risk_Rate', 'Simulation']].tail(len(forecast_months)))
+        
+    forecast_results = pd.concat(simulations)
+    
+    return historical_risk_rate, forecast_results
+
+# --- 6. MAIN APP ---
 def main():
+    # Update call to receive the new 'metrics' dictionary
     df, X_train_for_drift = load_data()
     if df is None: return
-    model, encoders, global_imp = train_models(df)
+    model, encoders, global_imp, metrics = train_models(df)
     
+    # Define the canonical list of features used by the model
+    trained_feature_cols = ['claim_type', 'location', 'claim_amount_SZL', 'rural_vs_urban', 
+                            'policy_premium_SZL', 'policy_maturity_years', 'segment']
+
     # --- HEADER & TICKER ---
     if 'scenario_mode' not in st.session_state: st.session_state.scenario_mode = "None (Baseline)"
     
@@ -188,40 +291,69 @@ def main():
     customer_ids = df['customer_id'].unique()
     selected_cust_id = st.sidebar.selectbox("Select Customer ID", customer_ids[:100])
     
-    # Get Data
-    cust_data = df[df['customer_id'] == selected_cust_id]
-    latest_claim = cust_data.sort_values('claim_date', ascending=False).iloc[0]
+    # Get Data for selected customer and sort by date
+    cust_data = df[df['customer_id'] == selected_cust_id].sort_values('claim_date', ascending=True).copy()
+    if cust_data.empty:
+        st.sidebar.warning("No data found for this customer.")
+        return
     
-    # INPUT DICTIONARY
+    # --- CALCULATE RISK FOR ALL CUSTOMER CLAIMS ---
+    customer_claims_encoded = cust_data[trained_feature_cols].copy()
+    
+    for col, le in encoders.items():
+        if col in customer_claims_encoded.columns:
+            def safe_transform_cust(val):
+                s_val = str(val)
+                if s_val in le.classes_:
+                    return le.transform([s_val])[0]
+                # Default to the first class if unseen category encountered
+                return le.transform([le.classes_[0]])[0] 
+            
+            customer_claims_encoded[col] = customer_claims_encoded[col].apply(safe_transform_cust)
+
+    # Predict risk for customer's historical claims
+    cust_data['Risk_Prob'] = model.predict_proba(customer_claims_encoded)[..., 1]
+    cust_data['Risk_Prob_Pct'] = cust_data['Risk_Prob'] * 100
+    
+    customer_risk_trend = cust_data[['claim_date', 'Risk_Prob_Pct']].copy()
+    
+    # Get the latest claim data point for the single-claim analysis
+    latest_claim = cust_data.iloc[-1] 
+    base_prob = latest_claim['Risk_Prob']
+
+    # INPUT DICTIONARY (Used for Radar Chart/SHAP Input Display)
     input_data = {
-        'claim_type': latest_claim['claim_type'], 
-        'location': latest_claim['location'], 
-        'claim_amount_SZL': latest_claim['claim_amount_SZL'],
-        'rural_vs_urban': latest_claim['rural_vs_urban'], 
-        'policy_premium_SZL': latest_claim['policy_premium_SZL'], 
-        'policy_maturity_years': latest_claim['policy_maturity_years'], 
-        'segment': str(latest_claim['segment']) 
+        'claim_type': latest_claim.get('claim_type', 'Unknown'), 
+        'location': latest_claim.get('location', 'Manzini'), 
+        'claim_amount_SZL': latest_claim.get('claim_amount_SZL', 1000),
+        'rural_vs_urban': latest_claim.get('rural_vs_urban', 'Unknown'), 
+        'policy_premium_SZL': latest_claim.get('policy_premium_SZL', 500), 
+        'policy_maturity_years': latest_claim.get('policy_maturity_years', 5), 
+        'segment': str(latest_claim.get('segment', '0'))
     }
     input_df = pd.DataFrame([input_data])
     
-    # PREDICT
+    # PREDICT: Get the encoded features for the latest claim needed for SHAP
     enc_df = input_df.copy()
     for col, le in encoders.items():
         val = str(enc_df[col].iloc[0])
         enc_df[col] = le.transform([val if val in le.classes_ else le.classes_[0]])
 
-    base_prob = model.predict_proba(enc_df)[0][1]
-    
     # SHAP
     explainer = shap.TreeExplainer(model)
-    shap_values = explainer.shap_values(enc_df)
-    # Robust extraction
+    try:
+        # Use enc_df for SHAP calculation
+        shap_values = explainer.shap_values(enc_df)
+    except Exception:
+        shap_values = explainer.shap_values(enc_df.iloc[0]) 
+
     if isinstance(shap_values, list):
         sv = shap_values[1] if len(shap_values) > 1 else shap_values[0]
     else:
         sv = shap_values[..., 1] if len(shap_values.shape) > 2 else shap_values
     
     if len(sv.shape) > 1: sv = sv[0] # Flatten
+
     
     # Contribution DataFrame (Fixed)
     contrib_df = pd.DataFrame({
@@ -230,7 +362,8 @@ def main():
     }).sort_values(by='SHAP', key=abs, ascending=True) # Sorted for bar chart
 
     # --- TABS ---
-    tab1, tab2, tab3 = st.tabs(["🚦 Risk Engine (Real-Time)", "🌍 Strategic Intel (Trends)", "🔮 Crystal Ball (Simulations)"])
+    # Added tab4
+    tab1, tab2, tab3, tab4 = st.tabs(["🚦 Risk Engine (Real-Time)", "🌍 Strategic Intel (Trends)", "🔮 Crystal Ball (Simulations)", "⚙️ Model Audit (Evaluation)"])
 
     # ==============================================================================
     # TAB 1: RISK ENGINE (The Decision Center)
@@ -238,7 +371,7 @@ def main():
     with tab1:
         st.markdown("### 🕵️ Forensic Claim Analysis")
         
-        # ROW 1: Gauge + Radar (The "Visual Identity" of the claim)
+        # ROW 1: Gauge + Radar + SHAP Drivers
         c1, c2, c3 = st.columns([1, 1.5, 1.5])
         
         with c1:
@@ -262,7 +395,7 @@ def main():
             # RADAR CHART (New!)
             radar = get_radar_data(df, input_data)
             fig_radar = go.Figure()
-            fig_radar.add_trace(go.Scatterpolar(r=radar['Fraud_Avg'], theta=radar['categories'], fill='toself', name='Avg Fraudster', line_color='#FF2B2B', opacity=0.6))
+            fig_radar.add_trace(go.Scatterpolar(r=radar['Fraud_Avg'], theta=radar['categories'], fill='toself', name='Avg High-Risk', line_color='#FF2B2B', opacity=0.6))
             fig_radar.add_trace(go.Scatterpolar(r=radar['Current'], theta=radar['categories'], fill='toself', name='Current Claim', line_color='#00C2FF', opacity=0.6))
             fig_radar.update_layout(
                 polar=dict(bgcolor="#1E2130", radialaxis=dict(visible=True, showticklabels=False, gridcolor="#333")),
@@ -291,12 +424,44 @@ def main():
 
         st.markdown("---")
         
-        # ROW 2: Counterfactual (Text Action)
-        st.subheader("💡 AI Recommendation Engine")
-        if base_prob > 0.5:
-            st.warning(f"**Negotiation Strategy:** If the Claim Amount is reduced by **15%**, the risk score is projected to drop below the critical threshold.")
-        else:
-            st.info("**Optimization:** Customer is low-risk. Suggest **Cross-Selling** 'Vehicle Gap Cover' based on their segment.")
+        # ROW 2: Recommendation Engine and Customer Trend (New layout)
+        col_rec, col_trend = st.columns([1, 1])
+
+        with col_rec:
+            st.subheader("💡 AI Recommendation Engine")
+            if base_prob > 0.5:
+                st.warning(f"**Negotiation Strategy:** If the Claim Amount is reduced by **15%**, the risk score is projected to drop below the critical threshold.")
+            else:
+                st.info("**Optimization:** Customer is low-risk. Suggest **Cross-Selling** 'Vehicle Gap Cover' based on their segment.")
+        
+        with col_trend:
+            st.subheader("📊 Customer Claim History")
+            st.caption(f"Risk Probability Trend for {selected_cust_id}")
+            
+            # CUSTOMER RISK TREND LINE CHART
+            fig_cust_trend = px.line(customer_risk_trend, x='claim_date', y='Risk_Prob_Pct',
+                                    title='Risk Probability Over Time', template="plotly_dark")
+            
+            # Highlight the latest claim point
+            latest_claim_prob = customer_risk_trend['Risk_Prob_Pct'].iloc[-1]
+            latest_claim_date = customer_risk_trend['claim_date'].iloc[-1]
+
+            fig_cust_trend.add_trace(go.Scatter(
+                x=[latest_claim_date], y=[latest_claim_prob],
+                mode='markers', name='Latest Claim',
+                marker=dict(size=12, color='#FF2B2B', symbol='circle')
+            ))
+            
+            fig_cust_trend.update_traces(mode='lines', line_color='#00C2FF')
+            fig_cust_trend.update_layout(
+                paper_bgcolor="#0E1117", plot_bgcolor="#0E1117", font_color="white",
+                yaxis_title="Risk Probability (%)", xaxis_title="Claim Date",
+                height=350, margin=dict(t=40, l=20, r=20, b=20),
+                showlegend=False
+            )
+            
+            st.plotly_chart(fig_cust_trend, use_container_width=True)
+
 
     # ==============================================================================
     # TAB 2: STRATEGIC INTEL (Maps & Trends)
@@ -304,7 +469,38 @@ def main():
     with tab2:
         st.markdown("### 🌍 Market Intelligence")
         
-        # ROW 1: 3D Map + Sunburst
+        # ROW 1: Trend Risk Analysis (NEW)
+        t1, t2 = st.columns([2, 1])
+
+        with t1:
+            st.caption("TREND RISK ANALYSIS: HIGH-RISK CLAIMS RATE (Monthly)")
+            # --- NEW GRAPH: RISK RATE TREND ---
+            # Group by month and calculate the average Risk_Target (which is the risk rate)
+            risk_trend_data = df.groupby('Month_Year')['Risk_Target'].mean().reset_index()
+            risk_trend_data['Risk_Target'] *= 100 # Convert to percentage
+            
+            fig_risk_trend = px.line(risk_trend_data, x='Month_Year', y='Risk_Target', 
+                                    title='Percentage of Claims Flagged as High-Risk', template="plotly_dark")
+            
+            fig_risk_trend.update_traces(mode='lines+markers', line_color='#00FF9D', marker_size=4)
+            fig_risk_trend.update_layout(
+                paper_bgcolor="#0E1117", plot_bgcolor="#0E1117", font_color="white",
+                yaxis_title="High-Risk Rate (%)", xaxis_title="Time (Month/Year)",
+                height=300, margin=dict(t=40, l=20, r=20, b=20)
+            )
+            st.plotly_chart(fig_risk_trend, use_container_width=True)
+            
+        with t2:
+            st.caption("GLOBAL RISK DRIVERS")
+            # TREEMAP (Fixed)
+            fig_tree = px.treemap(
+                global_imp, path=['Feature'], values='Importance',
+                color='Importance', color_continuous_scale='Sunsetdark'
+            )
+            fig_tree.update_layout(paper_bgcolor="#0E1117", height=300, margin=dict(t=0, l=0, r=0, b=0))
+            st.plotly_chart(fig_tree, use_container_width=True)
+
+        # ROW 2: 3D Map + Sunburst
         m1, m2 = st.columns([2, 1])
         
         with m1:
@@ -329,29 +525,6 @@ def main():
             fig_sun.update_layout(paper_bgcolor="#0E1117", height=350, margin=dict(t=0, l=0, r=0, b=0))
             st.plotly_chart(fig_sun, use_container_width=True)
 
-        # ROW 2: Trend Lines & Treemap
-        t1, t2 = st.columns([2, 1])
-        
-        with t1:
-            st.caption("CLAIM VOLUME TREND (2018-2024)")
-            # AGGREGATE BY MONTH
-            trend_data = df.groupby('Month_Year')['claim_amount_SZL'].sum().reset_index()
-            trend_data['Month_Year'] = trend_data['Month_Year'].astype(str)
-            
-            fig_area = px.area(trend_data, x='Month_Year', y='claim_amount_SZL', template="plotly_dark")
-            fig_area.update_traces(line_color='#00C2FF', fill='tozeroy', fillcolor='rgba(0, 194, 255, 0.2)')
-            fig_area.update_layout(paper_bgcolor="#0E1117", height=300, margin=dict(t=20, l=20, r=20, b=20))
-            st.plotly_chart(fig_area, use_container_width=True)
-            
-        with t2:
-            st.caption("GLOBAL RISK DRIVERS")
-            # TREEMAP (Fixed)
-            fig_tree = px.treemap(
-                global_imp, path=['Feature'], values='Importance',
-                color='Importance', color_continuous_scale='Sunsetdark'
-            )
-            fig_tree.update_layout(paper_bgcolor="#0E1117", height=300, margin=dict(t=0, l=0, r=0, b=0))
-            st.plotly_chart(fig_tree, use_container_width=True)
 
     # ==============================================================================
     # TAB 3: CRYSTAL BALL (Scenarios)
@@ -359,6 +532,73 @@ def main():
     with tab3:
         st.header("🔮 Future Simulations")
         
+        # ROW 1: Bootstrapped Forecast (NEW)
+        st.markdown("### 📈 Bootstrapped Risk Forecast")
+        
+        hist_data, forecast_data = run_bootstrap_simulation(df, model)
+
+        # FIX: Calculate percentage column on components before combining and use them directly for plotting
+        mean_forecast = forecast_data.groupby('Month_Year')['Risk_Rate'].mean().reset_index()
+        mean_forecast['Type'] = 'Forecast (Mean)'
+        mean_forecast['Risk_Rate_Pct'] = mean_forecast['Risk_Rate'] * 100 
+        
+        hist_data['Type'] = 'Historical'
+        hist_data['Risk_Rate_Pct'] = hist_data['Risk_Rate'] * 100 
+        
+        # Calculate confidence interval (P25 and P75) from the bootstraps
+        p25 = forecast_data.groupby('Month_Year')['Risk_Rate'].quantile(0.25).reset_index().rename(columns={'Risk_Rate': 'P25'})
+        p75 = forecast_data.groupby('Month_Year')['Risk_Rate'].quantile(0.75).reset_index().rename(columns={'Risk_Rate': 'P75'})
+
+        
+        # --- NEW GRAPH: BOOTSTRAPPED FORESTED LINE GRAPH ---
+        
+        fig_bootstrap = go.Figure()
+        
+        # 1. Historical Trend (Using the updated hist_data directly)
+        fig_bootstrap.add_trace(go.Scatter(
+            x=hist_data['Month_Year'], y=hist_data['Risk_Rate_Pct'],
+            mode='lines+markers', name='Historical Risk Rate',
+            line=dict(color='#00FF9D', width=2)
+        ))
+        
+        # 2. Confidence Interval (P25-P75 Band)
+        fig_bootstrap.add_trace(go.Scatter(
+            x=p75['Month_Year'], y=p75['P75'] * 100,
+            mode='lines', name='Upper Bound (75th Percentile)',
+            line=dict(color='#00C2FF', width=0),
+            showlegend=False
+        ))
+
+        fig_bootstrap.add_trace(go.Scatter(
+            x=p25['Month_Year'], y=p25['P25'] * 100,
+            mode='lines', name='25th/75th Percentile Interval',
+            fill='tonexty', fillcolor='rgba(0, 194, 255, 0.2)',
+            line=dict(color='#00C2FF', width=0),
+            showlegend=True
+        ))
+        
+        # 3. Mean Forecast Line (Using the updated mean_forecast directly)
+        fig_bootstrap.add_trace(go.Scatter(
+            x=mean_forecast['Month_Year'], y=mean_forecast['Risk_Rate_Pct'],
+            mode='lines+markers', name='Mean Forecast',
+            line=dict(color='#FF2B2B', width=3, dash='dash')
+        ))
+        
+        # Layout adjustments
+        fig_bootstrap.update_layout(
+            paper_bgcolor="#0E1117", plot_bgcolor="#0E1117", font_color="white",
+            title="Future Risk Rate Forecast with 50 Bootstrapped Simulations",
+            xaxis_title="Time", yaxis_title="Risk Rate (%)",
+            height=400, margin=dict(t=40, l=20, r=20, b=20),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        )
+        
+        st.plotly_chart(fig_bootstrap, use_container_width=True)
+        
+        st.markdown("---")
+        
+        # ROW 2: Scenario Stress Testing (Original Content)
+        st.markdown("### 🌪️ Stress Test: Capital Reserve Simulation")
         scen_col, res_col = st.columns([1, 2])
         
         with scen_col:
@@ -397,6 +637,74 @@ def main():
             if scenario != "None":
                 diff = sim_loss - base_loss
                 st.error(f"⚠️ PROJECTED CAPITAL DEFICIT: SZL {diff:,.2f}")
+
+    # ==============================================================================
+    # TAB 4: MODEL AUDIT (Evaluation)
+    # ==============================================================================
+    with tab4:
+        st.header("⚙️ Model Audit: Performance and Reliability")
+        st.markdown("Metrics evaluated on a 30% held-out test set.")
+        
+        # ROW 1: Key Metrics
+        m1, m2, m3, m4, m5 = st.columns(5)
+
+        def display_metric(col, label, value, color_hex):
+            col.markdown(f"""
+                <div style='background-color: #1E2130; border: 1px solid {color_hex}; padding: 10px; border-radius: 8px; text-align: center; box-shadow: 0 0 10px {color_hex}33;'>
+                    <p style='margin: 0; font-size: 0.9em; color: #aaa;'>{label}</p>
+                    <h3 style='margin: 5px 0 0; font-size: 1.5em; color: {color_hex};'>{value:.4f}</h3>
+                </div>
+            """, unsafe_allow_html=True)
+
+        display_metric(m1, "Accuracy", metrics['accuracy'], "#00C2FF")
+        display_metric(m2, "Precision", metrics['precision'], "#00FF9D")
+        display_metric(m3, "Recall (Sensitivity)", metrics['recall'], "#FF2B2B")
+        display_metric(m4, "F1 Score", metrics['f1'], "#FFD700")
+        display_metric(m5, "ROC AUC", metrics['roc_auc'], "#FFFFFF")
+
+        st.markdown("---")
+        
+        # ROW 2: Confusion Matrix and ROC Curve
+        c_matrix_col, roc_col = st.columns(2)
+        
+        with c_matrix_col:
+            st.subheader("Confusion Matrix")
+            cm = metrics['conf_matrix']
+            cm_df = pd.DataFrame(cm, 
+                                 index=['Actual Low-Risk', 'Actual High-Risk'], 
+                                 columns=['Predicted Low-Risk', 'Predicted High-Risk'])
+            
+            # Plot Confusion Matrix
+            fig_cm = px.imshow(cm_df, text_auto=True, 
+                                color_continuous_scale='plasma', 
+                                labels=dict(x="Predicted", y="Actual", color="Count"))
+            fig_cm.update_xaxes(side="bottom")
+            fig_cm.update_layout(
+                paper_bgcolor="#0E1117", plot_bgcolor="#0E1117", font_color="white",
+                title="Classification Outcomes (Test Set)", height=450, 
+                margin=dict(t=50, l=10, r=10, b=10)
+            )
+            st.plotly_chart(fig_cm, use_container_width=True)
+            
+        with roc_col:
+            st.subheader("ROC Curve (Performance Trade-off)")
+            # Plot ROC Curve
+            fpr, tpr, thresholds = roc_curve(metrics['y_test'], metrics['y_proba'])
+            
+            fig_roc = go.Figure()
+            fig_roc.add_trace(go.Scatter(x=fpr, y=tpr, mode='lines', name=f'ROC Curve (AUC = {metrics["roc_auc"]:.4f})', line=dict(color='#00FF9D', width=3)))
+            fig_roc.add_trace(go.Scatter(x=[0, 1], y=[0, 1], mode='lines', name='Random Classifier (AUC = 0.5)', line=dict(dash='dash', color='grey')))
+            
+            fig_roc.update_layout(
+                paper_bgcolor="#0E1117", plot_bgcolor="#0E1117", font_color="white",
+                xaxis_title='False Positive Rate (FPR)',
+                yaxis_title='True Positive Rate (TPR / Recall)',
+                yaxis=dict(scaleanchor="x", scaleratio=1),
+                xaxis=dict(constrain='domain'),
+                height=450, margin=dict(t=50, l=10, r=10, b=10),
+                legend=dict(yanchor="bottom", xanchor="right", x=0.99, y=0.01)
+            )
+            st.plotly_chart(fig_roc, use_container_width=True)
 
 if __name__ == "__main__":
     main()
