@@ -172,7 +172,8 @@ def get_radar_data(df, input_row):
     }
 
 # --- 5. HELPER: BOOTSTRAP SIMULATION ---
-@st.cache_data(show_spinner="Running Bootstrap Simulations...")
+# FIX: Use hash_funcs to handle the unhashable scikit-learn model object
+@st.cache_data(show_spinner="Running Bootstrap Simulations...", hash_funcs={RandomForestClassifier: lambda _: 'fixed_model_hash'})
 def run_bootstrap_simulation(df, model, n_bootstraps=50):
     """
     Simulates future risk trend using a bootstrapped approach.
@@ -250,6 +251,10 @@ def main():
     if df is None: return
     model, encoders, global_imp = train_models(df)
     
+    # Define the canonical list of features used by the model
+    trained_feature_cols = ['claim_type', 'location', 'claim_amount_SZL', 'rural_vs_urban', 
+                            'policy_premium_SZL', 'policy_maturity_years', 'segment']
+
     # --- HEADER & TICKER ---
     if 'scenario_mode' not in st.session_state: st.session_state.scenario_mode = "None (Baseline)"
     
@@ -265,15 +270,37 @@ def main():
     customer_ids = df['customer_id'].unique()
     selected_cust_id = st.sidebar.selectbox("Select Customer ID", customer_ids[:100])
     
-    # Get Data
-    cust_data = df[df['customer_id'] == selected_cust_id]
+    # Get Data for selected customer and sort by date
+    cust_data = df[df['customer_id'] == selected_cust_id].sort_values('claim_date', ascending=True).copy()
     if cust_data.empty:
         st.sidebar.warning("No data found for this customer.")
         return
     
-    latest_claim = cust_data.sort_values('claim_date', ascending=False).iloc[0]
+    # --- CALCULATE RISK FOR ALL CUSTOMER CLAIMS ---
+    customer_claims_encoded = cust_data[trained_feature_cols].copy()
     
-    # INPUT DICTIONARY
+    for col, le in encoders.items():
+        if col in customer_claims_encoded.columns:
+            def safe_transform_cust(val):
+                s_val = str(val)
+                if s_val in le.classes_:
+                    return le.transform([s_val])[0]
+                # Default to the first class if unseen category encountered
+                return le.transform([le.classes_[0]])[0] 
+            
+            customer_claims_encoded[col] = customer_claims_encoded[col].apply(safe_transform_cust)
+
+    # Predict risk for customer's historical claims
+    cust_data['Risk_Prob'] = model.predict_proba(customer_claims_encoded)[..., 1]
+    cust_data['Risk_Prob_Pct'] = cust_data['Risk_Prob'] * 100
+    
+    customer_risk_trend = cust_data[['claim_date', 'Risk_Prob_Pct']].copy()
+    
+    # Get the latest claim data point for the single-claim analysis
+    latest_claim = cust_data.iloc[-1] 
+    base_prob = latest_claim['Risk_Prob']
+
+    # INPUT DICTIONARY (Used for Radar Chart/SHAP Input Display)
     input_data = {
         'claim_type': latest_claim.get('claim_type', 'Unknown'), 
         'location': latest_claim.get('location', 'Manzini'), 
@@ -285,23 +312,18 @@ def main():
     }
     input_df = pd.DataFrame([input_data])
     
-    # PREDICT
+    # PREDICT: Get the encoded features for the latest claim needed for SHAP
     enc_df = input_df.copy()
-    # Apply encoders safely
     for col, le in encoders.items():
         val = str(enc_df[col].iloc[0])
-        # Use existing class if present, otherwise default to first class for prediction
         enc_df[col] = le.transform([val if val in le.classes_ else le.classes_[0]])
 
-    base_prob = model.predict_proba(enc_df)[0][1]
-    
     # SHAP
     explainer = shap.TreeExplainer(model)
-    # The shap_values might need transformation depending on the model output structure
     try:
+        # Use enc_df for SHAP calculation
         shap_values = explainer.shap_values(enc_df)
     except Exception:
-        # Fallback for unexpected SHAP output structure
         shap_values = explainer.shap_values(enc_df.iloc[0]) 
 
     if isinstance(shap_values, list):
@@ -327,7 +349,7 @@ def main():
     with tab1:
         st.markdown("### 🕵️ Forensic Claim Analysis")
         
-        # ROW 1: Gauge + Radar (The "Visual Identity" of the claim)
+        # ROW 1: Gauge + Radar + SHAP Drivers
         c1, c2, c3 = st.columns([1, 1.5, 1.5])
         
         with c1:
@@ -380,12 +402,44 @@ def main():
 
         st.markdown("---")
         
-        # ROW 2: Counterfactual (Text Action)
-        st.subheader("💡 AI Recommendation Engine")
-        if base_prob > 0.5:
-            st.warning(f"**Negotiation Strategy:** If the Claim Amount is reduced by **15%**, the risk score is projected to drop below the critical threshold.")
-        else:
-            st.info("**Optimization:** Customer is low-risk. Suggest **Cross-Selling** 'Vehicle Gap Cover' based on their segment.")
+        # ROW 2: Recommendation Engine and Customer Trend (New layout)
+        col_rec, col_trend = st.columns([1, 1])
+
+        with col_rec:
+            st.subheader("💡 AI Recommendation Engine")
+            if base_prob > 0.5:
+                st.warning(f"**Negotiation Strategy:** If the Claim Amount is reduced by **15%**, the risk score is projected to drop below the critical threshold.")
+            else:
+                st.info("**Optimization:** Customer is low-risk. Suggest **Cross-Selling** 'Vehicle Gap Cover' based on their segment.")
+        
+        with col_trend:
+            st.subheader("📊 Customer Claim History")
+            st.caption(f"Risk Probability Trend for {selected_cust_id}")
+            
+            # CUSTOMER RISK TREND LINE CHART
+            fig_cust_trend = px.line(customer_risk_trend, x='claim_date', y='Risk_Prob_Pct',
+                                    title='Risk Probability Over Time', template="plotly_dark")
+            
+            # Highlight the latest claim point
+            latest_claim_prob = customer_risk_trend['Risk_Prob_Pct'].iloc[-1]
+            latest_claim_date = customer_risk_trend['claim_date'].iloc[-1]
+
+            fig_cust_trend.add_trace(go.Scatter(
+                x=[latest_claim_date], y=[latest_claim_prob],
+                mode='markers', name='Latest Claim',
+                marker=dict(size=12, color='#FF2B2B', symbol='circle')
+            ))
+            
+            fig_cust_trend.update_traces(mode='lines', line_color='#00C2FF')
+            fig_cust_trend.update_layout(
+                paper_bgcolor="#0E1117", plot_bgcolor="#0E1117", font_color="white",
+                yaxis_title="Risk Probability (%)", xaxis_title="Claim Date",
+                height=350, margin=dict(t=40, l=20, r=20, b=20),
+                showlegend=False
+            )
+            
+            st.plotly_chart(fig_cust_trend, use_container_width=True)
+
 
     # ==============================================================================
     # TAB 2: STRATEGIC INTEL (Maps & Trends)
